@@ -170,3 +170,23 @@ def test_second_immediate_run_and_demo_are_rejected_while_queue_active(client, m
     assert filled == ["active"]
     assert not refused
     assert not any(job.get("demo") for job in client.app.state.store.jobs())
+
+
+def test_unknown_questions_are_preserved_for_review_without_a_submission_attempt(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "question-needed")
+    question = {"question": "Which editor do you use?", "type": "text", "required": True}
+
+    async def fake_application(job, profile, resume_path, **options):
+        return {"status": "needs_attention", "message": "An exact answer is needed.", "pending_questions": [question]}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", fake_application)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    saved = client.app.state.store.job("question-needed")
+    assert saved["status"] == "needs_attention"
+    assert saved["pending_questions"] == [question]
+    assert saved["attempted_at"] is None
+    assert state["answer_memory"]["pending"][0]["question"] == question["question"]
+    assert state["answer_memory"]["pending"][0]["job_id"] == "question-needed"
+    assert not state["queue"]["can_run"]

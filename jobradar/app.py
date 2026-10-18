@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules
 from .store import Store, now
@@ -47,6 +48,42 @@ def create_app(data_dir: Path | None = None):
 
     def worker_busy():
         return state["running"] or state["demo_running"] or bool(state["task"] and not state["task"].done())
+
+    def configuration_problems(profile, rules, resume):
+        problems = setup_problems(profile, rules, resume)
+        if resume.get("loaded") and not resume_intact(resume, data_dir):
+            problems.append("The uploaded resume file is missing or changed. Upload it again before approval.")
+        return problems
+
+    def submission_check(job, rules):
+        problems = job_problems(job, rules)
+        if job["status"] not in ("new", "queued"):
+            if job["status"] == "applied_elsewhere":
+                problems.append("This application is already recorded as applied; automatic retry is disabled.")
+            else:
+                problems.append("Only discovered or queued roles can run. Resolve any review notes before adding this role to the queue.")
+        elif store.destination_attempted(job):
+            problems.append("This posting or a listing with the same employer and title is already recorded as applied. Automatic retry is disabled.")
+        return {"eligible": not problems, "blockers": problems}
+
+    def queue_readiness(jobs, profile, rules, resume, approval):
+        pending = [job for job in jobs if not job.get("demo") and job["status"] in ("new", "queued")]
+        ready = sum(job["submission_check"]["eligible"] for job in pending)
+        day = datetime.now(timezone.utc).date().isoformat()
+        attempts = store.attempt_count(day)
+        remaining = max(0, rules["daily_limit"] - attempts)
+        problems = configuration_problems(profile, rules, resume)
+        if not valid_approval(profile, rules, resume, approval):
+            problems.append("Review and approve your saved profile, resume and application rules.")
+        if not remaining:
+            problems.append("Daily submission-attempt limit reached (UTC day). Your remaining queue is saved.")
+        if not pending:
+            problems.append("No discovered or queued roles are available. Fetch jobs or add a reviewed role to the queue.")
+        elif not ready:
+            problems.append("No queued roles currently pass your saved rules. Check each role's submission blockers before running.")
+        return {"pending": len(pending), "ready": ready, "blocked": len(pending) - ready,
+                "attempts_today": attempts, "remaining_today": remaining,
+                "can_run": not problems and not worker_busy(), "blockers": problems}
 
     def invalidate():
         store.set("approval", {"approved": False, "approved_at": None})
@@ -145,7 +182,7 @@ def create_app(data_dir: Path | None = None):
                     result_status = result.get("status", "needs_attention")
                     if result_status not in {"submitted", "needs_attention", "uncertain", "failed"}:
                         result_status = "needs_attention"
-                    store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None)
+                    store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None, pending_questions=result.get("pending_questions", []))
                     store.event(result_status, f"{job['company']} — {job['title']}: {result.get('message', result_status)}", job["id"])
             except Exception as error:
                 # Don't print profile contents or requests into logs.
@@ -190,6 +227,7 @@ def create_app(data_dir: Path | None = None):
     app.state.store = store
     app.state.data_dir = data_dir
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+    register_answer_memory_routes(app, store, invalidate)
 
     @app.middleware("http")
     async def local_boundary(request, call_next):
@@ -221,7 +259,9 @@ def create_app(data_dir: Path | None = None):
         profile, rules, resume, approval = configuration()
         jobs = store.jobs()
         real_jobs = [job for job in jobs if not job.get("demo")]
-        return {"profile": profile, "rules": rules, "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")}, "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"), "candidate_fingerprint": fingerprint(profile, rules, resume)}, "jobs": jobs, "events": store.events(), "stats": {"total": len(real_jobs), "queued": sum(job["status"] in ("new", "queued") for job in real_jobs), "submitted": sum(job["status"] == "submitted" for job in real_jobs), "needs_attention": sum(job["status"] in ("needs_attention", "uncertain", "failed") for job in real_jobs)}, "automation": {"enabled": store.get("automation", {}).get("enabled", False), "running": state["running"] or state["demo_running"], "fetching": state["fetching"]}, "last_fetch": store.get("last_fetch"), "setup_problems": setup_problems(profile, rules, resume)}
+        for job in real_jobs:
+            job["submission_check"] = submission_check(job, rules)
+        return {"profile": profile, "rules": rules, "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")}, "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"), "candidate_fingerprint": fingerprint(profile, rules, resume)}, "jobs": jobs, "events": store.events(), "answer_memory": answer_memory_state(profile, jobs), "stats": {"total": len(real_jobs), "queued": sum(job["status"] in ("new", "queued") for job in real_jobs), "submitted": sum(job["status"] == "submitted" for job in real_jobs), "needs_attention": sum(job["status"] in ("needs_attention", "uncertain", "failed") for job in real_jobs)}, "queue": queue_readiness(jobs, profile, rules, resume, approval), "automation": {"enabled": store.get("automation", {}).get("enabled", False), "running": worker_busy(), "fetching": state["fetching"]}, "last_fetch": store.get("last_fetch"), "setup_problems": configuration_problems(profile, rules, resume)}
 
     @app.post("/api/profile")
     async def save_profile(profile: Profile):
@@ -280,9 +320,7 @@ def create_app(data_dir: Path | None = None):
         profile, rules, resume, _ = configuration()
         if body.expected_fingerprint != fingerprint(profile, rules, resume):
             raise HTTPException(409, "Settings changed since your review. Reload and review the current profile, resume and rules.")
-        problems = setup_problems(profile, rules, resume)
-        if not resume_intact(resume, data_dir):
-            problems.append("The uploaded resume file is missing or changed.")
+        problems = configuration_problems(profile, rules, resume)
         if problems:
             raise HTTPException(400, " ".join(problems))
         store.set("approval", {"approved": True, "approved_at": now(), "fingerprint": fingerprint(profile, rules, resume)})
@@ -304,16 +342,23 @@ def create_app(data_dir: Path | None = None):
             raise HTTPException(409, "Approve your verified profile, resume and submission rules first.")
         if worker_busy():
             raise HTTPException(409, "The queue is already running.")
+        snapshot = get_state()
+        if not snapshot["queue"]["can_run"]:
+            raise HTTPException(409, " ".join(snapshot["queue"]["blockers"]))
         store.set("stop_requested", False)
         state["running"] = True
         state["task"] = asyncio.create_task(run_queue())
-        return {"message": "Approved queue started."}
+        return {"message": f"Approved queue started with {snapshot['queue']['ready']} eligible role(s).", "ready": snapshot["queue"]["ready"]}
 
     @app.post("/api/automation")
     async def automation_endpoint(body: AutomationRequest):
         enabled = body.enabled
         if enabled and not approved():
             raise HTTPException(409, "Approve the current profile and rules before enabling automation.")
+        if enabled:
+            problems = configuration_problems(*configuration()[:3])
+            if problems:
+                raise HTTPException(409, " ".join(problems))
         store.set("automation", {"enabled": enabled})
         store.set("stop_requested", not enabled)
         store.event("automation", "Scheduled automation enabled while this app is running." if enabled else "Automation stopped; an in-flight click may already have completed. Check its recorded result.")
@@ -360,7 +405,7 @@ def create_app(data_dir: Path | None = None):
                 store.reserve_attempt(job_id, "demo-only", 1_000_000)
 
             result = await run_application(job, profile, path, allowed_hosts={"127.0.0.1"}, artifacts_dir=data_dir / "artifacts" / job_id, submit=True, fixture=True, before_submit=before_submit)
-            store.update_job(job_id, result["status"], message=result.get("message"), error=None if result["status"] == "submitted" else result.get("message"), confirmation=result.get("confirmation"))
+            store.update_job(job_id, result["status"], message=result.get("message"), error=None if result["status"] == "submitted" else result.get("message"), confirmation=result.get("confirmation"), pending_questions=result.get("pending_questions", []))
             store.event("demo", f"Local mock application: {result.get('message', result['status'])}", job_id)
         except Exception as error:
             store.update_job(job_id, "failed", error=f"Demo failed ({type(error).__name__}). Verify browser installation.")

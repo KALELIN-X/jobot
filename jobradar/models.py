@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -60,7 +60,7 @@ class Profile(StrictModel):
     graduation_date: str | None = None
     work_authorized: bool | None = None
     needs_sponsorship: bool | None = None
-    answers: dict[str, str] = Field(default_factory=dict, max_length=60)
+    answers: dict[str, StrictStr | StrictBool] = Field(default_factory=dict, max_length=60)
 
     @field_validator("email")
     @classmethod
@@ -103,9 +103,9 @@ class Profile(StrictModel):
     @field_validator("answers")
     @classmethod
     def check_answers(cls, values):
-        if any(not key.strip() or len(key) > 500 or not value.strip() or len(value) > 4000 for key, value in values.items()):
+        if any(not key.strip() or len(key) > 500 or (isinstance(value, str) and (not value.strip() or len(value) > 4000)) for key, value in values.items()):
             raise ValueError("Saved answers need a question and answer (up to 4,000 characters).")
-        return {key.strip(): value.strip() for key, value in values.items()}
+        return {key.strip(): value.strip() if isinstance(value, str) else value for key, value in values.items()}
 
 
 class Rules(StrictModel):
@@ -137,6 +137,6 @@ class Rules(StrictModel):
     @field_validator("allowed_ats")
     @classmethod
     def check_ats(cls, values):
-        if values != ["lever"]:
-            raise ValueError("This version supports Lever only.")
+        if values not in ([], ["lever"]):
+            raise ValueError("Allow Lever applications or leave automatic application systems disabled. Other systems are not supported.")
         return values

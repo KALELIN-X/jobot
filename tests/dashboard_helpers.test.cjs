@@ -64,3 +64,48 @@ test("new-grad review ordering does not change fit scores or erase unknown eligi
   assert.equal(newGrad.score, 55);
   assert.equal(newGrad.score_detail.eligibility[0].status, "unknown");
 });
+
+function queueHelpers() {
+  const source = fs.readFileSync(path.join(__dirname, "..", "static", "app.js"), "utf8");
+  const start = source.indexOf("  function queueControlState(");
+  const end = source.indexOf("  function renderQueueStatus(", start);
+  assert.ok(start >= 0 && end > start);
+  const context = {list: value => Array.isArray(value) ? value : []};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {queueControlState, setupDestination};", context);
+  return context.helpers;
+}
+
+test("unapproved and blocked queues have an actionable review path", () => {
+  const {queueControlState} = queueHelpers();
+  const setup = queueControlState({approval: {approved: false}, queue: {ready: 0, can_run: false}});
+  assert.equal(setup.label, "Review & start queue");
+  assert.equal(setup.needsReview, true);
+  assert.equal(setup.canRun, false);
+  const blocked = queueControlState({approval: {approved: true}, queue: {ready: 0, can_run: false}});
+  assert.equal(blocked.label, "Review queue blockers");
+  assert.equal(blocked.needsReview, true);
+});
+
+test("one-time runs work without enabling scheduling; dirty forms or busy workers cannot run", () => {
+  const {queueControlState} = queueHelpers();
+  const snapshot = {approval: {approved: true}, queue: {ready: 1, can_run: true}, automation: {enabled: false}};
+  assert.equal(queueControlState(snapshot).canRun, true);
+  assert.equal(snapshot.automation.enabled, false);
+  assert.equal(queueControlState(snapshot, true).canRun, false);
+  assert.equal(queueControlState({...snapshot, automation: {running: true}}).canRun, false);
+});
+
+test("setup links target the actual missing setting, including unmapped employers and disabled Lever", () => {
+  const {setupDestination} = queueHelpers();
+  const snapshot = {profile: {name: "Alex Example", email: "alex@example.test"}, resume: {loaded: true}, rules: {companies: [], allowed_ats: ["lever"]}};
+  assert.match(setupDestination(snapshot).selector, /companies/);
+  snapshot.rules.companies = ["Example"];
+  assert.match(setupDestination(snapshot).selector, /company_boards/);
+  snapshot.rules.company_boards = {example: "example"};
+  assert.equal(setupDestination(snapshot).selector, "#approval-acknowledge");
+  snapshot.rules.allowed_ats = [];
+  assert.match(setupDestination(snapshot).selector, /allowed_ats/);
+  snapshot.resume.loaded = false;
+  assert.equal(setupDestination(snapshot).selector, "#resume-file");
+});

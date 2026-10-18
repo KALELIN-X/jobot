@@ -77,6 +77,14 @@ def test_unconfigured_app_cannot_be_approved():
     assert len(setup_problems(Profile().model_dump(), Rules().model_dump(), {})) >= 3
 
 
+def test_disabling_lever_is_an_explicit_submission_boundary():
+    disabled = rules(allowed_ats=[])
+    problems = job_problems(eligible_job(), disabled)
+    assert "Lever applications are disabled in your saved rules." in problems
+    assert any("Enable Lever" in problem for problem in setup_problems(
+        Profile(name="Alex", email="alex@example.test").model_dump(), disabled, {"loaded": True}))
+
+
 def test_attempts_are_durable_unique_and_counted_before_confirmation(tmp_path):
     store = Store(tmp_path / "db.sqlite3")
     store.save_job(eligible_job(status="filling"))

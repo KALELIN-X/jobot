@@ -34,6 +34,11 @@ _DECLARATION = re.compile(
     r"\bi\s+(?:hereby\s+)?(?:certify|attest|declare)\b)",
     re.I,
 )
+_PRIVATE_CHALLENGE = re.compile(
+    r"\b(?:password|passcode|captcha|verification code|security code|one[\s-]+time[\s-]+code|"
+    r"otp|totp|2fa|mfa|api key|access token|auth(?:entication)? token|"
+    r"social security|ssn|bank account|routing number)\b", re.I,
+)
 _CONFIRMATION = (
     r"(?:application\s+(?:(?:has been|was)\s+)?(?:successfully\s+)?submitted"
     r"|(?:we\s+(?:have\s+)?received\s+your\s+application)"
@@ -136,6 +141,37 @@ class FieldAction:
 class FormPlan:
     actions: list[FieldAction] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
+    pending_questions: list[dict] = field(default_factory=list)
+
+
+def reusable_question(question: str) -> bool:
+    """Only ordinary questions belong in reusable memory, never challenges or agreements."""
+    return bool(question and len(question) <= 500 and not _LEGAL.search(question) and not _PRIVATE_CHALLENGE.search(question))
+
+
+def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[dict] | None = None) -> None:
+    # Keep the visible question and choices, never the site's prefilled value.
+    # A machine input name alone is not a question that the user can review.
+    question = _label(item.get("label"))
+    kind = "select" if item.get("tag") == "select" else str(item.get("type", "text")).lower()
+    if not reusable_question(question) or kind not in {"text", "email", "tel", "url", "number", "date", "month", "search", "textarea", "select", "checkbox", "radio"}:
+        return
+    if any(candidate["question"] == question for candidate in plan.pending_questions):
+        return
+    choices = []
+    for option in options if options is not None else item.get("options", []):
+        label = re.sub(r"\s+", " ", str(option.get("label") or "")).strip()
+        value = str(option.get("value", ""))
+        if option.get("disabled") or not label or not value or len(label) > 500 or len(value) > 500:
+            continue
+        if {"label": label, "value": value} not in choices:
+            choices.append({"label": label, "value": value})
+    if len(plan.pending_questions) < 60:
+        plan.pending_questions.append({
+            "id": hashlib.sha256(question.encode("utf-8")).hexdigest()[:20],
+            "key": question, "question": question, "type": kind,
+            "required": bool(item.get("required")), "options": choices[:100], "reason": reason,
+        })
 
 
 def _answer(item: dict, profile: dict) -> Any:
@@ -241,24 +277,29 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             continue
         answer = _answer(item, profile)
         if answer is None or answer == "" or isinstance(answer, (dict, list, tuple, set)):
+            _pending_question(plan, item, reason="missing_answer")
             if required:
                 plan.blockers.append(f"No explicit approved answer for required field: {description[:160]}")
             continue
         if kind == "checkbox":
             if type(answer) is not bool:
+                _pending_question(plan, item, reason="boolean_required")
                 plan.blockers.append(f"An explicit boolean answer is required: {description[:160]}")
             elif required and not answer:
+                _pending_question(plan, item, reason="required_checkbox_conflict")
                 plan.blockers.append(f"Required checkbox conflicts with the approved answer: {description[:160]}")
             elif bool(item.get("checked")) != answer:
                 plan.actions.append(FieldAction(item["id"], "check", answer))
         elif item.get("tag") == "select" or kind == "select":
             option = _option_match(item.get("options", []), answer)
             if option is None or str(option.get("value", "")) == "":
+                _pending_question(plan, item, reason="choice_unavailable")
                 plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
             elif str(item.get("value", "")) != str(option["value"]):
                 plan.actions.append(FieldAction(item["id"], "select", str(option["value"])))
         elif kind in {"text", "email", "tel", "url", "number", "date", "month", "search", "textarea"}:
             if isinstance(answer, bool):
+                _pending_question(plan, item, reason="text_required")
                 plan.blockers.append(f"A typed answer needs human review: {description[:160]}")
             elif str(item.get("value", "")) != str(answer):
                 plan.actions.append(FieldAction(item["id"], "fill", str(answer)))
@@ -272,6 +313,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         options = [dict(i, label=i.get("option_label", i.get("value", ""))) for i in group]
         selected = _option_match(options, answer) if answer is not None else None
         if selected is None:
+            _pending_question(plan, dict(example, required=any(i.get("required") for i in group)), reason="missing_choice", options=options)
             if any(i.get("required") for i in group) or answer is not None:
                 plan.blockers.append(f"No exact approved choice for required question: {label[:160]}")
         elif not selected.get("checked"):
@@ -385,6 +427,7 @@ async def run_application(
     clicked = False
     screenshot = None
     page = None
+    pending_questions: list[dict] = []
     blocked_requests: list[str] = []
 
     async def result(status: str, message: str, **extra) -> dict:
@@ -397,7 +440,7 @@ async def run_application(
                 screenshot = str(path.resolve())
             except Exception:
                 pass
-        payload = {"status": status, "message": message, **extra}
+        payload = {"status": status, "message": message, "pending_questions": pending_questions, **extra}
         if screenshot:
             payload["screenshot"] = screenshot
         return payload
@@ -440,6 +483,7 @@ async def run_application(
                 for _ in range(3):
                     blockers = _form_blockers(state, url, allowed_hosts, fixture)
                     plan = plan_form(state["fields"], profile, resume_path)
+                    pending_questions = plan.pending_questions
                     blockers += plan.blockers
                     if blockers:
                         return await result("needs_attention", " ".join(dict.fromkeys(blockers))[:1200])
@@ -463,6 +507,7 @@ async def run_application(
                     return await result("needs_attention", "The application kept changing while fields were filled.")
 
                 final_plan = plan_form(state["fields"], profile, resume_path)
+                pending_questions = final_plan.pending_questions
                 blockers = _form_blockers(state, url, allowed_hosts, fixture) + final_plan.blockers
                 if final_plan.actions or blockers:
                     return await result("needs_attention", " ".join(blockers)[:1200] or "The form needs human review after filling.")

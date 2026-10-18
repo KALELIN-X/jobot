@@ -23,6 +23,7 @@
   let sourceMessage = "";
   let currentView = "queue";
   let approvalReview = null;
+  let lastMemorySignature = "";
   const dirty = {profile:false,rules:false};
   const initialized = {profile:false,rules:false};
   const expanded = new Set();
@@ -123,6 +124,7 @@
       const heading = $(`#view-${view} h1`);
       heading.setAttribute("tabindex","-1");
       heading.focus({preventScroll:true});
+      window.scrollTo(0,0);
     }
   }
   function isDemo(job) {
@@ -177,7 +179,7 @@
     return (Number.isFinite(Number(b.score)) && b.score !== null ? Number(b.score) : -1) - (Number.isFinite(Number(a.score)) && a.score !== null ? Number(a.score) : -1);
   }
   function renderJobs(force = false) {
-    const signature = JSON.stringify([state.jobs,state.rules,filter,search,experienceFilterEnabled]);
+    const signature = JSON.stringify([state.jobs,state.rules,state.answer_memory?.pending,filter,search,experienceFilterEnabled]);
     if (!force && signature === lastJobSignature) return;
     lastJobSignature = signature;
     const allJobs = list(state.jobs);
@@ -226,14 +228,17 @@
     const hideJobActions = isDemo(job) || Boolean(job.attempted_at) || ["active","filling","submitting","applying","uncertain","applied_elsewhere"].includes(status);
     const canRecordApplied = !hideJobActions && !isSubmitted;
     const priorApplicationHelp = canRecordApplied && !leverPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact Lever posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
+    const checks = list(job.submission_check?.blockers);
+    const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-memory">Answer new application questions →</button>' : ""}` : "";
     const submissionInfo = isSubmitted ? [...new Set([job.message,job.confirmation,job.error].filter(Boolean).map(value => typeof value === "object" ? JSON.stringify(value) : String(value)))].join(" ") : "";
-    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div><div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${!hideJobActions && !isSubmitted && !["new","queued"].includes(status) ? `<button type="button" class="button button-secondary" data-action="queue" data-id="${escape(id)}">Add to queue${icon("arrow")}</button>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div><div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${!hideJobActions && !isSubmitted && !["new","queued"].includes(status) ? `<button type="button" class="button button-secondary" data-action="queue" data-id="${escape(id)}">Add to queue${icon("arrow")}</button>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
     const resumeReady = Boolean(state.resume?.loaded);
     const companies = list(state.rules?.companies);
-    const boardsReady = companies.length > 0 && companies.every(company => Boolean((state.rules?.company_boards || {})[company]));
+    const boardNames = Object.keys(state.rules?.company_boards || {}).map(name => name.toLowerCase());
+    const boardsReady = companies.length > 0 && companies.every(company => boardNames.includes(company.toLowerCase()));
     const rulesReady = companies.length > 0 && boardsReady;
     const approved = Boolean(state.approval?.approved);
     $("#readiness-title").textContent = approved ? "Ready when you are" : "Before your first run";
@@ -245,33 +250,85 @@
     ];
     $("#readiness-steps").innerHTML = steps.map((step,index) => `<button type="button" class="readiness-step" data-view="${step.view}"><span class="step-number ${step.done ? "done" : ""}">${step.done ? icon("check") : String(index+1).padStart(2,"0")}</span><span class="step-copy"><strong>${step.title}</strong><small>${escape(step.description)}</small></span><span class="step-arrow">↗</span></button>`).join("");
   }
+  function queueControlState(snapshot, unsaved = false) {
+    const approved = snapshot.approval?.approved === true && !unsaved;
+    const running = snapshot.automation?.running === true;
+    const ready = snapshot.queue?.ready ?? 0;
+    return {
+      approved, running, ready,
+      canRun: approved && snapshot.queue?.can_run === true && !running,
+      label: running ? "Run in progress" : !approved ? "Review & start queue" : ready ? "Run approved queue" : "Review queue blockers",
+      needsReview: !approved || snapshot.queue?.can_run !== true,
+    };
+  }
+  function setupDestination(snapshot) {
+    if (!snapshot.profile?.name || !snapshot.profile?.email) return {view:"profile",selector:'#profile-form [name="name"]'};
+    if (!snapshot.resume?.loaded) return {view:"profile",selector:"#resume-file"};
+    const companies = list(snapshot.rules?.companies);
+    if (!companies.length) return {view:"rules",selector:'#rules-form [name="companies"]'};
+    const boards = Object.keys(snapshot.rules?.company_boards || {}).map(company => company.toLowerCase());
+    if (companies.some(company => !boards.includes(company.toLowerCase()))) return {view:"rules",selector:'#rules-form [name="company_boards"]'};
+    if (!list(snapshot.rules?.allowed_ats).includes("lever")) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
+    return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="companies"]' : "#approval-acknowledge"};
+  }
+  function openQueueReview() {
+    const target = dirty.profile ? {view:"profile",selector:'#profile-form button[type="submit"]'} : dirty.rules ? {view:"rules",selector:'#rules-form button[type="submit"]'} : setupDestination(state);
+    setView(target.view);
+    const field = $(target.selector);
+    field?.scrollIntoView({block:"center",behavior:"smooth"});
+    field?.focus({preventScroll:true});
+  }
+  function renderQueueStatus() {
+    const queue = state.queue || {};
+    const control = queueControlState(state,dirty.profile || dirty.rules);
+    const problems = list(queue.blockers);
+    const setup = list(state.setup_problems);
+    $("#queue-run-title").textContent = control.running ? "Your queue is running" : setup.length ? "Finish your application setup" : !control.approved ? "Review your rules to start" : control.ready ? `${control.ready} role${control.ready === 1 ? " is" : "s are"} ready to apply` : "No eligible applications yet";
+    $("#queue-run-description").textContent = control.running ? "Follow results and any new questions in Activity and Answer memory." : setup.length ? "Use the next step below to unlock approval and queue runs." : !control.approved ? "Approve the saved details, then choose a one-time run or scheduled applications." : control.ready ? "A one-time run submits matching jobs. Scheduling is a separate option." : "Review each role’s submission checks or adjust your saved rules. Approval does not override a blocked role.";
+    const visibleProblems = dirty.profile || dirty.rules ? ["Save your profile or rule changes before approving.",...problems] : problems;
+    $("#queue-blockers").innerHTML = visibleProblems.map(problem => `<li>${escape(problem)}</li>`).join("");
+    $("#queue-blockers").hidden = !visibleProblems.length || control.running;
+    $("#queue-health").textContent = loaded ? `${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.pending ?? 0} pending · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
+    $("#queue-review-button").textContent = setup.length ? "Complete setup →" : control.approved ? "Review rules →" : "Review & approve →";
+    $("#queue-review-button").disabled = control.running;
+  }
   function renderControls() {
     const approved = Boolean(state.approval?.approved);
     const running = Boolean(state.automation?.running);
     const enabled = Boolean(state.automation?.enabled);
     $("#profile-status").textContent = "";
-    $("#profile-status").innerHTML = `<span class="status-dot"></span>${approved ? "Profile approved" : "Profile unverified"}`;
+    $("#profile-status").innerHTML = `<span class="status-dot"></span>${approved ? "Rules approved" : "Approval needed"}`;
     $("#profile-status").classList.toggle("ready",approved);
     $("#automation-status").innerHTML = `<span class="status-dot"></span>${running ? "Run in progress" : enabled ? "Automation on" : "Automation off"}`;
     $("#automation-status").classList.toggle("enabled",enabled || running);
-    $("#run-button").disabled = !approved || running || busyActions.has("run");
-    $("#run-button").title = approved ? running ? "A run is already in progress" : "Submit eligible queued jobs within your approved rules" : "Save and approve your application rules first";
-    if (!busyActions.has("run")) $("#run-button").innerHTML = `${icon(running ? "refresh" : "play")}${running ? "Run in progress" : "Run approved queue"}`;
+    const control = queueControlState(state,dirty.profile || dirty.rules);
+    $("#run-button").disabled = !loaded || running || busyActions.has("run");
+    $("#run-button").title = control.canRun ? "Run eligible applications once; scheduling stays separate" : "Review your setup and the visible queue blockers";
+    if (!busyActions.has("run")) $("#run-button").innerHTML = `${icon(running ? "refresh" : control.canRun ? "play" : "arrow")}${control.label}`;
     $("#run-button").classList.toggle("busy",running || busyActions.has("run"));
     $("#fetch-button").disabled = busyActions.has("fetch") || running || Boolean(state.automation?.fetching);
     $("#automation-toggle").disabled = (!approved && !enabled) || busyActions.has("automation");
     $("#automation-toggle").setAttribute("aria-checked",String(enabled));
     $("#automation-toggle").setAttribute("aria-label",enabled ? "Disable scheduled applications" : "Enable scheduled applications");
-    $("#automation-card-label").textContent = running ? "A run is in progress" : enabled ? "Automation is on" : "Automation is off";
-    $("#automation-card-detail").textContent = enabled ? `Runs every ${state.rules?.interval_minutes || "—"} minutes.` : approved ? "Ready to follow your saved rules." : "Approve your rules to enable.";
+    $("#automation-card-label").textContent = running ? "A run is in progress" : enabled ? "Schedule is on" : "Schedule is off";
+    $("#automation-card-detail").textContent = enabled ? `Runs every ${state.rules?.interval_minutes || "—"} minutes while Jobot is open.` : approved ? "Enable for recurring runs. Run once works separately." : list(state.setup_problems)[0] || "Review and approve your saved rules first.";
+    $("#automation-setup").hidden = approved;
     const reviewReady = Boolean(approvalReview?.fingerprint);
     const reviewStale = reviewReady && approvalReview.fingerprint !== state.approval?.candidate_fingerprint;
     if (reviewStale) $("#approval-acknowledge").checked = false;
     const ack = $("#approval-acknowledge").checked;
-    $("#approve-button").disabled = !ack || !reviewReady || reviewStale || approved || dirty.profile || dirty.rules || busyActions.has("approve");
+    const setupProblems = list(state.setup_problems);
+    const approveDisabled = !ack || !reviewReady || reviewStale || approved || dirty.profile || dirty.rules || setupProblems.length > 0 || busyActions.has("approve") || running;
+    $("#approve-button").disabled = approveDisabled;
+    $("#approve-run-button").disabled = (approved ? running || dirty.profile || dirty.rules || busyActions.has("approve") : approveDisabled) || !state.queue?.ready || setupProblems.length > 0 || !(state.queue?.remaining_today > 0);
+    $("#approve-run-button").innerHTML = `${approved ? "Run approved queue once" : "Approve &amp; run once"}${icon("play")}`;
+    $("#approval-run-help").textContent = setupProblems.length ? "Complete the missing settings above to unlock approval. Eligible roles are required for a one-time run." : !state.queue?.ready ? "No roles pass all current rules yet. You can save approval now; review role checks before running." : !(state.queue?.remaining_today > 0) ? "Today's attempt limit has been reached (UTC)." : "This submits eligible roles once. Scheduled applications stay a separate choice.";
+    $("#approval-blockers").hidden = !setupProblems.length;
+    $("#approval-blockers").innerHTML = `<strong>Complete these before approval</strong><ul>${setupProblems.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul><button type="button" class="text-button" data-action="review-queue">Go to the next missing setting →</button>`;
     $("#approval-title").textContent = reviewStale ? "This review is out of date" : approved ? "Your rules are approved" : "Review before you run";
     $("#approval-status").textContent = reviewStale ? "Saved configuration changed. Refresh the saved review, check its details, then acknowledge again." : dirty.profile || dirty.rules ? "Save your pending changes before approving." : !reviewReady ? "Waiting for a saved configuration snapshot from the local server." : approved ? `Approved ${fullDate(state.approval.approved_at)}. Changes require a new approval.` : "This review stays fixed while Application rules is open.";
     $("#approval-acknowledge").disabled = approved || reviewStale || !reviewReady;
+    renderQueueStatus();
   }
   function renderSummary(force = false) {
     const fingerprint = state.approval?.candidate_fingerprint || null;
@@ -286,8 +343,65 @@
     const companies = list(rules.companies);
     const fields = [["Applicant",profile.name || "Not saved"],["Legal first name",profile.first_name || "Not provided"],["Legal last name",profile.last_name || "Not provided"],["Preferred first name",profile.preferred_first_name || "Not provided"],["Email",profile.email || "Not saved"],["Approved work locations",list(profile.approved_work_locations).length ? list(profile.approved_work_locations).join("; ") : "None confirmed"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Approved companies",companies.length ? `${companies.length} selected` : "None selected"],["Official Lever boards",`${Object.keys(rules.company_boards || {}).length} mapped`],["Locations",list(rules.locations).length ? list(rules.locations).join(", ") : "Any location"],["Minimum fit",`${rules.min_score ?? "—"} / 100`],["Maximum required experience",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "No experience" : `${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["Prioritize new grads",rules.prefer_new_grad ? "Yes, ranking preference" : "No"],["Daily limit (UTC day)",`${rules.daily_limit ?? "—"} applications`],["Run interval",`${rules.interval_minutes ?? "—"} minutes`],["Allowed systems",list(rules.allowed_ats).length ? list(rules.allowed_ats).map(item => String(item).toUpperCase()).join(", ") : "None"],["Known eligibility",rules.require_known_eligibility === false ? "Not required" : "Required"]];
     const boards = Object.entries(rules.company_boards || {}).map(([company,board]) => `${company} → ${board}`);
+    const answerReview = Object.entries(profile.answers || {}).map(([question,answer]) => `<div class="approval-row"><span>${escape(question)}</span><strong>${escape(typeof answer === "boolean" ? answer ? "Yes" : "No" : answer)}</strong></div>`).join("");
     const stale = Boolean(approvalReview.fingerprint && approvalReview.fingerprint !== fingerprint);
-    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + (boards.length ? `<div class="approval-companies">Lever boards: ${escape(boards.join(" · "))}</div>` : "") + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
+    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + (boards.length ? `<div class="approval-companies">Lever boards: ${escape(boards.join(" · "))}</div>` : "") + `<details class="approval-companies"><summary>Reusable answers (${Object.keys(profile.answers || {}).length})</summary>${answerReview || "No saved reusable answers."}</details>` + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
+  }
+  function renderAnswerMemory() {
+    const memory = state.answer_memory || {pending:[],saved:Object.entries(state.profile?.answers || {}).map(([question,answer]) => ({question,answer}))};
+    const signature = JSON.stringify(memory);
+    if (signature === lastMemorySignature) return;
+    lastMemorySignature = signature;
+    const pending = list(memory.pending);
+    const saved = list(memory.saved);
+    $("#memory-count").textContent = `${saved.length} saved`;
+    $("#pending-answer-count").textContent = pending.length;
+    $("#nav-memory-count").textContent = pending.length || saved.length;
+    $("#pending-answers").innerHTML = pending.length ? pending.map((item,index) => `<article class="answer-item"><div class="answer-context">${escape(item.company)} · ${escape(item.title)}${item.required ? " · Required" : " · Optional"}</div><h3>${escape(item.question)}</h3>${item.reason ? `<p>${escape(item.reason)}</p>` : ""}<button type="button" class="text-button" data-action="answer-question" data-index="${index}">Answer & remember →</button></article>`).join("") : '<p class="answer-empty">No new questions yet. When a supported form needs an unfamiliar answer, it will appear here.</p>';
+    $("#saved-answers").innerHTML = saved.length ? saved.map((item,index) => `<article class="answer-item saved-answer"><h3>${escape(item.question)}</h3><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p><div class="detail-actions"><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button><button type="button" class="text-button" data-action="forget-answer" data-index="${index}">Forget</button></div></article>`).join("") : '<p class="answer-empty">No reusable answers saved. Add one below or answer a question found during an application.</p>';
+  }
+  function resetAnswerForm() {
+    const form = $("#answer-memory-form");
+    form.reset();
+    form.elements.job_id.value = "";
+    form.elements.question.readOnly = false;
+    form.elements.answer.required = true;
+    form.elements.answer.disabled = false;
+    form.elements.choice.disabled = true;
+    form.elements.choice.required = false;
+    form.dataset.kind = "text";
+    $("#memory-text-field").hidden = false;
+    $("#memory-choice-field").hidden = true;
+    $("#memory-form-context").hidden = true;
+    $("#memory-form-title").textContent = "Add a reusable answer";
+  }
+  function editAnswer(item, pending = false) {
+    resetAnswerForm();
+    setView("profile");
+    const form = $("#answer-memory-form");
+    form.elements.question.value = item.question;
+    form.elements.question.readOnly = true;
+    form.elements.job_id.value = pending ? item.job_id : "";
+    form.dataset.kind = item.type || (typeof item.answer === "boolean" ? "checkbox" : "text");
+    const choice = ["checkbox","radio","select"].includes(form.dataset.kind);
+    if (choice) {
+      const options = form.dataset.kind === "checkbox" ? [{label:"Yes",value:"true"},{label:"No",value:"false"}] : list(item.options);
+      form.elements.choice.innerHTML = '<option value="">Choose your answer</option>' + options.map(option => `<option value="${escape(option.value)}">${escape(option.label)}</option>`).join("");
+      form.elements.choice.disabled = false;
+      form.elements.choice.required = true;
+      form.elements.answer.required = false;
+      form.elements.answer.disabled = true;
+      if (item.answer !== undefined) form.elements.choice.value = String(item.answer);
+    } else {
+      form.elements.answer.value = item.answer ?? "";
+    }
+    $("#memory-text-field").hidden = choice;
+    $("#memory-choice-field").hidden = !choice;
+    $("#memory-form-title").textContent = pending ? "Answer a new question" : "Update saved answer";
+    $("#memory-form-context").textContent = pending ? `Found at ${item.company}: ${item.title}. Saving does not retry this application. Review it and add it to the queue after answering.` : "This updates the answer reused across future applications with the same exact question.";
+    $("#memory-form-context").hidden = false;
+    form.scrollIntoView({block:"center",behavior:"smooth"});
+    (choice ? form.elements.choice : form.elements.answer).focus({preventScroll:true});
   }
   function renderActivity() {
     const events = list(state.events);
@@ -333,7 +447,8 @@
     const jobs = list(state.jobs);
     const stats = state.stats || {};
     $("#stat-total").textContent = formatNumber(stats.total ?? jobs.length);
-    $("#stat-queued").textContent = formatNumber(stats.queued ?? jobs.filter(job => ["new","queued"].includes(job.status)).length);
+    $("#stat-queued").textContent = formatNumber(state.queue?.ready ?? 0);
+    $("#stat-queue-caption").textContent = `${state.queue?.pending ?? stats.queued ?? 0} pending · ${state.queue?.blocked ?? 0} held by rules`;
     $("#stat-submitted").textContent = formatNumber(stats.submitted ?? jobs.filter(job => job.status === "submitted").length);
     $("#stat-attention").textContent = formatNumber(stats.needs_attention ?? jobs.filter(jobAttention).length);
     $("#nav-queue-count").textContent = $("#stat-queued").textContent;
@@ -346,6 +461,7 @@
     renderControls();
     renderReadiness();
     renderJobs();
+    renderAnswerMemory();
     renderActivity();
   }
   function refresh(manual = false) {
@@ -389,7 +505,23 @@
     if (!button) return;
     const name = button.dataset.action;
     const id = button.dataset.id;
-    if (name === "details") {
+    if (name === "review-queue") {
+      openQueueReview();
+    } else if (name === "open-memory") {
+      setView("profile");
+      $("#answer-memory").scrollIntoView({block:"start",behavior:"smooth"});
+    } else if (name === "answer-question") {
+      const item = list(state.answer_memory?.pending)[Number(button.dataset.index)];
+      if (item) editAnswer(item,true);
+    } else if (name === "edit-answer") {
+      const item = list(state.answer_memory?.saved)[Number(button.dataset.index)];
+      if (item) editAnswer(item);
+    } else if (name === "forget-answer") {
+      const item = list(state.answer_memory?.saved)[Number(button.dataset.index)];
+      if (!item) return;
+      if (dirty.profile) { showNotice("Save your pending profile changes before editing answer memory.",true); return; }
+      action("answer-memory",button,() => api("/api/answers",{method:"DELETE",body:JSON.stringify({question:item.question})}),"Answer removed. Review and approve your updated profile before running applications.");
+    } else if (name === "details") {
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
       const detail = document.getElementById(button.getAttribute("aria-controls"));
       const open = expanded.has(id);
@@ -421,6 +553,18 @@
   $("#job-search").addEventListener("input",event => { search = event.target.value.toLowerCase().trim(); renderJobs(true); });
   $("#experience-filter").addEventListener("change",event => { experienceFilterEnabled = event.target.checked; renderJobs(true); });
   $("#notice-close").addEventListener("click",() => { $("#notice").hidden = true; });
+  $("#memory-reset").addEventListener("click",resetAnswerForm);
+  $("#answer-memory-form").addEventListener("submit",event => {
+    event.preventDefault();
+    if (dirty.profile) { showNotice("Save your pending profile changes before editing answer memory.",true); return; }
+    const form = event.currentTarget;
+    if (!form.elements.acknowledge.checked) return;
+    const choice = !form.elements.choice.disabled;
+    const answer = choice ? form.dataset.kind === "checkbox" ? form.elements.choice.value === "true" : form.elements.choice.value : form.elements.answer.value.trim();
+    const body = {question:form.elements.question.value.trim(),answer};
+    if (form.elements.job_id.value) body.job_id = form.elements.job_id.value;
+    action("answer-memory",$("button[type=submit]",form),async () => { const result = await post("/api/answers",body); resetAnswerForm(); return result; },"Answer remembered locally for this exact question. Review and approve your updated profile before running applications.");
+  });
   $("#history-form").addEventListener("submit",event => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -438,8 +582,8 @@
     let answers = {};
     try {
       answers = form.elements.answers.value.trim() ? JSON.parse(form.elements.answers.value) : {};
-      if (!answers || Array.isArray(answers) || typeof answers !== "object" || Object.values(answers).some(value => typeof value !== "string")) throw new Error();
-    } catch { showNotice('Approved answers must be a JSON object of exact questions and text answers, for example: {"Question?": "Answer"}.',true); form.elements.answers.focus(); return; }
+      if (!answers || Array.isArray(answers) || typeof answers !== "object" || Object.values(answers).some(value => !["string","boolean"].includes(typeof value))) throw new Error();
+    } catch { showNotice('Approved answers must be a JSON object of exact questions and text or true/false answers, for example: {"Question?": "Answer"}.',true); form.elements.answers.focus(); return; }
     const body = {};
     ["name","first_name","last_name","preferred_first_name","email","phone","location","linkedin","github","portfolio","current_company"].forEach(name => { body[name] = form.elements[name].value.trim(); });
     body.skills = splitLines(form.elements.skills.value);
@@ -474,12 +618,16 @@
   });
   $("#approval-form").addEventListener("submit",event => {
     event.preventDefault();
+    const runAfter = event.submitter?.value === "run";
+    const alreadyApproved = state.approval?.approved === true;
     const expectedFingerprint = approvalReview?.fingerprint;
-    if (!$("#approval-acknowledge").checked || dirty.profile || dirty.rules || !expectedFingerprint || expectedFingerprint !== state.approval?.candidate_fingerprint) return;
-    action("approve",$("#approve-button"),async () => {
-      try { return await post("/api/approve",{acknowledge:true,expected_fingerprint:expectedFingerprint}); }
-      catch (error) { await refresh(true); throw error; }
-    },"Your saved rules are approved. Run the queue when you are ready, or enable scheduled applications.");
+    if (dirty.profile || dirty.rules || (!alreadyApproved && (!$("#approval-acknowledge").checked || !expectedFingerprint || expectedFingerprint !== state.approval?.candidate_fingerprint))) return;
+    action("approve",event.submitter || $("#approve-button"),async () => {
+      try {
+        if (!alreadyApproved) await post("/api/approve",{acknowledge:true,expected_fingerprint:expectedFingerprint});
+        if (runAfter) { const result = await post("/api/run"); setView("queue"); return result; }
+      } catch (error) { await refresh(true); throw error; }
+    },runAfter ? "One-time queue run started. Scheduled applications are a separate setting. Follow progress in Activity." : "Approval saved. You can run the queue once or enable scheduled applications.");
   });
   $("#automation-toggle").addEventListener("click",event => {
     const enabled = !state.automation?.enabled;
@@ -493,7 +641,11 @@
       finally { $("#source-message").textContent = sourceMessage; $("#source-message").hidden = !sourceMessage; }
     },result => result.message || "Job fetch completed. Newly discovered roles are ranked by resume fit.");
   });
-  $("#run-button").addEventListener("click",event => { if (state.approval?.approved) action("run",event.currentTarget,() => post("/api/run"),"Approved queue run requested. Follow the results in Activity."); });
+  $("#run-button").addEventListener("click",event => {
+    const control = queueControlState(state,dirty.profile || dirty.rules);
+    if (!control.canRun) { openQueueReview(); return; }
+    action("run",event.currentTarget,() => post("/api/run"),"One-time queue run started. Follow the results in Activity.");
+  });
   $("#refresh-activity").addEventListener("click",event => action("activity",event.currentTarget,() => refresh(true),"Activity refreshed."));
   window.addEventListener("hashchange",() => setView(location.hash.slice(1),false));
   document.addEventListener("visibilitychange",() => { if (!document.hidden) refresh(); });
