@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from datetime import date
 
 import httpx
@@ -206,7 +207,9 @@ def test_source_has_total_read_deadline_and_does_not_start_details(monkeypatch):
     assert requested == [ingest.SOURCE_URL]
 
 
-def posting(title="Engineer", location="Boston, MA", role="role", board="acme"):
+def posting(title="Engineer", location="Boston, MA", role="12345678-abcd-1234-abcd-123456789abc", board="acme"):
+    if role in {"role", "other", "duplicate"}:
+        role = str(uuid.uuid5(uuid.NAMESPACE_URL, role))
     return {"text": title, "categories": {"location": location},
             "applyUrl": f"https://jobs.lever.co/{board}/{role}/apply",
             "descriptionPlain": "Build Python APIs and production backend services. " * 4}

@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from jobradar.app import create_app, ordered_queue
 from jobradar.models import Rules
+from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
@@ -78,9 +79,13 @@ def test_api_persists_adjustable_preferences_and_revokes_prior_approval(client):
 def test_running_queue_uses_preference_then_unchanged_fit_score(client, monkeypatch, prefer_new_grad, expected):
     configure_and_approve(client, prefer_new_grad=prefer_new_grad)
     for index, (identifier, score, is_new_grad) in enumerate([("new-grad", 70, True), ("experienced", 95, False)]):
+        apply_url = f"https://jobs.lever.co/example/12345678-abcd-1234-abcd-{index:012x}/apply"
+        detail_url = f"https://jobright.ai/jobs/info/synthetic-{identifier}"
         client.app.state.store.save_job({
             "id": identifier, "company": "Example", "title": "Backend Engineer", "location": "Boston",
-            "ats": "lever", "apply_url": f"https://jobs.lever.co/example/12345678-abcd-1234-abcd-{index:012x}/apply",
+            "ats": "lever", "apply_url": apply_url,
+            "source": "Jobright", "source_url": SOURCE_URL, "detail_url": detail_url,
+            "destination_provenance": destination_provenance(apply_url, "jobright_detail", detail_url),
             "description": "Build Python backend APIs.", "score": score,
             "score_detail": {"is_new_grad": is_new_grad, "eligibility": []}, "status": "queued",
         })

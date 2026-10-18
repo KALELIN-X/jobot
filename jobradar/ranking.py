@@ -5,6 +5,8 @@ import re
 from datetime import date
 from typing import Any
 
+from .models import company_scope
+
 # Aliases describe one concept, so e.g. AWS is never counted twice.
 _SKILLS: dict[str, tuple[str, ...]] = {
     "Python": ("python",), "Java": ("java",),
@@ -295,7 +297,7 @@ def _new_grad_signal(title: str, description: str) -> bool:
 def _eligibility(job: dict, profile: dict, rules: dict, description: str, experience: dict) -> list[dict]:
     result = []
     companies = rules.get("companies") or []
-    if companies:
+    if company_scope(rules) == "selected":
         allowed = _norm(job.get("company")) in {_norm(company) for company in companies}
         result.append(_entry("Approved company", "pass" if allowed else "fail", f"{job.get('company') or 'Unknown company'} {'is' if allowed else 'is not'} in your company allowlist."))
     locations = rules.get("locations") or []

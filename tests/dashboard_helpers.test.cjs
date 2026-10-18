@@ -67,12 +67,12 @@ test("new-grad review ordering does not change fit scores or erase unknown eligi
 
 function queueHelpers() {
   const source = fs.readFileSync(path.join(__dirname, "..", "static", "app.js"), "utf8");
-  const start = source.indexOf("  function queueControlState(");
+  const start = source.indexOf("  function companyScope(");
   const end = source.indexOf("  function renderQueueStatus(", start);
   assert.ok(start >= 0 && end > start);
   const context = {list: value => Array.isArray(value) ? value : []};
   vm.createContext(context);
-  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {queueControlState, setupDestination};", context);
+  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {queueControlState, setupDestination, companyScope, locationMode, exactLines};", context);
   return context.helpers;
 }
 
@@ -96,16 +96,33 @@ test("one-time runs work without enabling scheduling; dirty forms or busy worker
   assert.equal(queueControlState({...snapshot, automation: {running: true}}).canRun, false);
 });
 
-test("setup links target the actual missing setting, including unmapped employers and disabled Lever", () => {
+test("any-company setup skips employer names and boards; a selected list remains optional", () => {
   const {setupDestination} = queueHelpers();
-  const snapshot = {profile: {name: "Alex Example", email: "alex@example.test"}, resume: {loaded: true}, rules: {companies: [], allowed_ats: ["lever"]}};
+  const snapshot = {profile: {name: "Alex Example", email: "alex@example.test"}, resume: {loaded: true}, rules: {company_scope:"any",companies: [], allowed_ats: ["lever"]}};
+  assert.equal(setupDestination(snapshot).selector, "#approval-acknowledge");
+  snapshot.rules.company_scope = "selected";
   assert.match(setupDestination(snapshot).selector, /companies/);
   snapshot.rules.companies = ["Example"];
-  assert.match(setupDestination(snapshot).selector, /company_boards/);
-  snapshot.rules.company_boards = {example: "example"};
   assert.equal(setupDestination(snapshot).selector, "#approval-acknowledge");
   snapshot.rules.allowed_ats = [];
   assert.match(setupDestination(snapshot).selector, /allowed_ats/);
   snapshot.resume.loaded = false;
   assert.equal(setupDestination(snapshot).selector, "#resume-file");
+});
+
+test("simple company and location controls preserve existing preferences", () => {
+  const {companyScope,locationMode} = queueHelpers();
+  assert.equal(companyScope({}), "any");
+  assert.equal(companyScope({companies:["Example"]}), "selected");
+  assert.equal(companyScope({company_scope:"any",companies:["Example"]}), "any");
+  assert.equal(locationMode(["United States","USA","U.S.","US"]), "us");
+  assert.equal(locationMode(["Remote"]), "remote");
+  assert.equal(locationMode(["New York","Chicago"]), "custom");
+  assert.equal(locationMode([]), "any");
+});
+
+test("saving exact location and employer lists does not split names containing commas", () => {
+  const {exactLines} = queueHelpers();
+  assert.deepEqual(Array.from(exactLines("San Francisco, CA\nChicago\r\nSan Francisco, CA")), ["San Francisco, CA","Chicago"]);
+  assert.deepEqual(Array.from(exactLines("Widgets, Inc.\nAnother Company")), ["Widgets, Inc.","Another Company"]);
 });

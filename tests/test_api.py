@@ -66,12 +66,12 @@ def test_approval_requires_acknowledgement_and_revokes_after_edit(client):
     assert not state["automation"]["enabled"]
 
 
-def test_approval_requires_exact_employer_board(client):
+def test_approval_does_not_require_manual_employer_board_configuration(client):
     configure(client)
     client.post("/api/rules", headers=HEADERS, json={"companies": ["Unconfigured employer"]})
     response = approve(client)
-    assert response.status_code == 400
-    assert "Lever board" in response.json()["detail"]
+    assert response.status_code == 200
+    assert client.get("/api/state").json()["rules"]["company_scope"] == "selected"
 
 
 def test_stale_tab_cannot_approve_unreviewed_settings(client):

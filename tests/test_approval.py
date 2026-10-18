@@ -5,13 +5,19 @@ import pytest
 
 from jobradar.approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from jobradar.models import Profile, Rules
+from jobradar.ingest import SOURCE_URL, destination_provenance
 from jobradar.store import Store
 
 URL = "https://jobs.lever.co/example/12345678-abcd-1234-abcd-123456789abc/apply"
 
 
 def eligible_job(**changes):
-    return {"id": "1", "company": "Example", "title": "Backend engineer", "location": "Boston", "ats": "lever", "apply_url": URL, "description": "Java APIs", "score": 80, "score_detail": {"eligibility": []}, **changes}
+    job = {"id": "1", "company": "Example", "title": "Backend engineer", "location": "Boston", "ats": "lever", "apply_url": URL, "description": "Java APIs", "score": 80, "score_detail": {"eligibility": []}, **changes}
+    job.setdefault("source", "Jobright")
+    job.setdefault("source_url", SOURCE_URL)
+    job.setdefault("detail_url", "https://jobright.ai/jobs/info/synthetic-role-1234")
+    job.setdefault("destination_provenance", destination_provenance(job["apply_url"], "jobright_detail", job["detail_url"]))
+    return job
 
 
 def rules(**changes):
@@ -21,7 +27,9 @@ def rules(**changes):
 def test_valid_job_and_exact_employer_destination():
     assert job_problems(eligible_job(), rules()) == []
     assert job_problems(eligible_job(company="Example Subsidiary"), rules())
-    assert job_problems(eligible_job(apply_url=URL.replace("/example/", "/other/")), rules())
+    changed_destination = eligible_job()
+    changed_destination["apply_url"] = URL.replace("/example/", "/other/")
+    assert job_problems(changed_destination, rules())
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:9000/", "https://jobs.lever.co:bad/", "https://jobs.lever.co.evil.test/example/123/apply", "https://user:pass@jobs.lever.co/example/123/apply"])
@@ -74,7 +82,7 @@ def test_resume_integrity_and_path_boundary(tmp_path):
 
 
 def test_unconfigured_app_cannot_be_approved():
-    assert len(setup_problems(Profile().model_dump(), Rules().model_dump(), {})) >= 3
+    assert len(setup_problems(Profile().model_dump(), Rules().model_dump(), {})) == 2
 
 
 def test_disabling_lever_is_an_explicit_submission_boundary():

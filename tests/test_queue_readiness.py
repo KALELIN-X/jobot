@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jobradar.app import create_app
+from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
@@ -35,12 +36,17 @@ def configure(client, approve=True):
 
 
 def add_job(client, identifier="ready", **changes):
-    client.app.state.store.save_job({
+    job = {
         "id": identifier, "company": "Example", "title": "Software Engineer",
         "location": "Boston, MA", "ats": "lever", "apply_url": f"https://jobs.lever.co/example/{POSTING}/apply",
         "description": "Build Python backend services.", "score": 90,
         "score_detail": {"eligibility": []}, "status": "queued", **changes,
-    })
+    }
+    job.setdefault("source", "Jobright")
+    job.setdefault("source_url", SOURCE_URL)
+    job.setdefault("detail_url", "https://jobright.ai/jobs/info/synthetic-role-1234")
+    job.setdefault("destination_provenance", destination_provenance(job["apply_url"], "jobright_detail", job["detail_url"]))
+    client.app.state.store.save_job(job)
 
 
 def test_pending_roles_are_not_misrepresented_as_submission_ready(client):

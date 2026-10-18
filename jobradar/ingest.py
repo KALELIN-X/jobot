@@ -18,6 +18,9 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from .autofill import LEVER_HOSTS, URLNotApproved, validate_application_url
+from .store import application_key
+
 SOURCE_URL = "https://raw.githubusercontent.com/jobright-ai/2026-Software-Engineer-New-Grad/master/README.md"
 MAX_JOBS = 100
 MAX_SOURCE_BYTES = 2_000_000
@@ -119,6 +122,57 @@ def classify_ats(url: str | None) -> str:
     return _ATS_HOSTS.get(urlsplit(safe).hostname, "unsupported") if safe else "unsupported"
 
 
+def canonical_lever_application_url(url: Any) -> str | None:
+    """Resolve only supported Lever posting URLs to a strict application URL."""
+    if not isinstance(url, str):
+        return None
+    try:
+        if urlsplit(url).fragment:
+            return None
+        key = application_key({"apply_url": url})
+        if not key:
+            return None
+        canonical = "https://" + key.removeprefix("lever:") + "/apply"
+        validate_application_url(canonical, set(LEVER_HOSTS))
+        return canonical
+    except (URLNotApproved, ValueError):
+        return None
+
+
+def destination_provenance(url: Any, kind: str, source_url: str) -> dict | None:
+    canonical = canonical_lever_application_url(url)
+    if not canonical:
+        return None
+    if kind == "jobright_detail":
+        if canonical_detail_url(source_url) != source_url:
+            return None
+    elif kind == "lever_board":
+        board = urlsplit(canonical).path.strip("/").split("/")[0]
+        if source_url != f"https://api.lever.co/v0/postings/{board}?mode=json":
+            return None
+    else:
+        return None
+    return {"kind": kind, "source_url": source_url,
+            "application_key": application_key({"apply_url": canonical})}
+
+
+def verified_destination(job: dict) -> bool:
+    """Require a bound source record, rather than trusting a pasted ATS URL."""
+    provenance = job.get("destination_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    if (job.get("source") != "Jobright" or job.get("source_url") != SOURCE_URL
+            or not job.get("detail_url") or canonical_detail_url(job["detail_url"]) != job["detail_url"]):
+        return False
+    canonical = canonical_lever_application_url(job.get("apply_url"))
+    if canonical is None or canonical != job.get("apply_url"):
+        return False
+    expected = destination_provenance(canonical, provenance.get("kind"), provenance.get("source_url"))
+    if not expected or provenance != expected:
+        return False
+    return provenance["kind"] != "jobright_detail" or provenance["source_url"] == job["detail_url"]
+
+
 def parse_markdown(markdown: str, limit: int = 40) -> list[dict]:
     """Read table rows in source order, carrying the company across ↳ rows."""
     limit = max(0, min(int(limit), MAX_JOBS))
@@ -151,6 +205,7 @@ def parse_markdown(markdown: str, limit: int = 40) -> list[dict]:
             "description": "", "description_source": None,
             "requirements": [], "required_skills": [], "preferred_skills": [],
             "apply_url": None, "ats": "unsupported", "closed": None,
+            "destination_provenance": None,
             "fetch_error": None,
         })
     return jobs
@@ -267,12 +322,37 @@ def _strings(value: Any) -> list[str]:
     return []
 
 
+def _detail_application_urls(nodes: list[dict]) -> list[str]:
+    """Prefer explicit apply fields; original-posting fields are a fallback.
+
+    More than one distinct destination stays ambiguous. Canonical Lever paths
+    make a posting/apply suffix or tracking query the same destination.
+    """
+    groups = (
+        ("applyUrl", "applyURL", "apply_url", "applicationUrl", "applicationURL", "application_url"),
+        ("externalJobUrl", "originalJobUrl", "jobUrl"),
+    )
+    for keys in groups:
+        urls = []
+        for node in nodes:
+            for key in keys:
+                safe = _public_application_url(node.get(key))
+                if safe:
+                    safe = canonical_lever_application_url(safe) or safe
+                    if safe not in urls:
+                        urls.append(safe)
+        if urls:
+            return urls
+    return []
+
+
 def parse_detail(document: str, detail_url: str = "") -> dict:
     parser = _PublicHTML()
     parser.feed(document)
     result: dict = {"description": "", "description_source": None, "apply_url": None,
                     "ats": "unsupported", "requirements": [], "required_skills": [],
-                    "preferred_skills": [], "closed": None, "fetch_error": None}
+                    "preferred_skills": [], "closed": None, "fetch_error": None,
+                    "destination_provenance": None}
     job_id = urlsplit(detail_url).path.rstrip("/").split("/")[-1]
     nodes: list[dict] = []
     for script in parser.scripts[:30]:
@@ -280,9 +360,34 @@ def parse_detail(document: str, detail_url: str = "") -> dict:
             nodes.extend(_walk(json.loads(script)))
         except (ValueError, TypeError, RecursionError):
             continue
-    candidates = [node for node in nodes if
-                  (node.get("jobId") and (not job_id or str(node["jobId"]) == job_id))
-                  or node.get("@type") == "JobPosting"]
+    primary = [node for node in nodes if node.get("jobId") and job_id and str(node["jobId"]) == job_id]
+    structured = [node for node in nodes if node.get("@type") == "JobPosting"
+                  or (isinstance(node.get("@type"), list) and "JobPosting" in node["@type"])]
+    # Do not mix a matching job with recommended JSON-LD roles on the same page.
+    # An exact page URL can select JSON-LD for display, but only an exact jobId
+    # supplies automatic-application provenance below.
+    bound_structured = []
+    canonical = canonical_detail_url(detail_url)
+    if canonical:
+        for node in structured:
+            identity_urls = [node.get("url"), node.get("@id")]
+            page = node.get("mainEntityOfPage")
+            identity_urls.append(page.get("@id") if isinstance(page, dict) else page)
+            if any(isinstance(value, str) and canonical_detail_url(value) == canonical for value in identity_urls):
+                bound_structured.append(node)
+    candidates = primary or bound_structured or (structured if len(structured) == 1 else [])
+    application_urls = _detail_application_urls(candidates)
+    destination_error = None
+    if len(application_urls) == 1:
+        result["apply_url"] = application_urls[0]
+        if primary and canonical:
+            result["destination_provenance"] = destination_provenance(
+                application_urls[0], "jobright_detail", canonical,
+            )
+    elif len(application_urls) > 1:
+        destination_error = "Conflicting application URLs in the job data; the destination needs review"
+    elif not candidates and len(structured) > 1:
+        destination_error = "Multiple unbound jobs appear in the page data; the application destination needs review"
     parts: list[str] = []
     for node in candidates[:5]:
         for key in ("description", "jobDescription", "jobSummary", "coreResponsibilities", "skillSummaries", "educationSummaries", "benefitsSummaries"):
@@ -301,12 +406,6 @@ def parse_detail(document: str, detail_url: str = "") -> dict:
                                        if isinstance(s, dict) and s.get("skill"))
         if isinstance(node.get("isDeleted"), bool):
             result["closed"] = node["isDeleted"]
-        # Only fields that identify an actual application destination are trusted.
-        for key in ("applyUrl", "applyURL", "apply_url", "applicationUrl", "applicationURL", "application_url", "externalJobUrl", "originalJobUrl", "jobUrl"):
-            safe = _public_application_url(node.get(key))
-            if safe:
-                result["apply_url"] = safe
-                break
     description = "\n".join(dict.fromkeys(part for part in parts if part))
     if len(description) >= 80:
         result["description"] = description[:MAX_DESCRIPTION_CHARS]
@@ -318,19 +417,29 @@ def parse_detail(document: str, detail_url: str = "") -> dict:
         if start and not blocked and len(readable[start.start():]) >= 120:
             result["description"] = readable[start.start():][:MAX_DESCRIPTION_CHARS]
             result["description_source"] = "Public Jobright readable text"
-    if not result["apply_url"]:
+    if not result["apply_url"] and destination_error is None:
+        anchor_urls = []
         for href, label in parser.links:
             safe = _public_application_url(href)
             if safe and re.search(r"\bapply\b", label, re.I):
-                result["apply_url"] = safe
-                break
+                safe = canonical_lever_application_url(safe) or safe
+                if safe not in anchor_urls:
+                    anchor_urls.append(safe)
+        if len(anchor_urls) == 1:
+            # A generic Apply link is useful to open manually, but its label
+            # alone cannot prove that it belongs to the primary job.
+            result["apply_url"] = anchor_urls[0]
+        elif len(anchor_urls) > 1:
+            destination_error = "Multiple Apply links appear on the page; the application destination needs review"
     result["ats"] = classify_ats(result["apply_url"])
     for key in ("requirements", "required_skills", "preferred_skills"):
         result[key] = list(dict.fromkeys(result[key]))
     missing = []
     if not result["description"]:
         missing.append("Full description is unavailable in the public page")
-    if not result["apply_url"]:
+    if destination_error:
+        missing.append(destination_error)
+    elif not result["apply_url"]:
         missing.append("Employer application URL is unavailable in the public page")
     result["fetch_error"] = "; ".join(missing) or None
     return result
@@ -439,7 +548,7 @@ def match_lever_posting(job: dict, postings: list[dict], board: str) -> dict | N
             continue
         if not _compatible_location(job.get("location", ""), posting):
             continue
-        safe = _public_application_url(posting.get("applyUrl"))
+        safe = canonical_lever_application_url(_public_application_url(posting.get("applyUrl")))
         if not safe or classify_ats(safe) != "lever":
             continue
         path = urlsplit(safe).path.strip("/").split("/")
@@ -483,7 +592,11 @@ async def enrich_lever_jobs(jobs: list[dict], company_boards: dict[str, str]) ->
                                 parts.extend(_strings(section.get("content")))
                         parts.extend(_strings(posting.get("additionalPlain")))
                         description = "\n".join(parts)
-                        job["apply_url"] = _public_application_url(posting["applyUrl"])
+                        job["apply_url"] = canonical_lever_application_url(posting["applyUrl"])
+                        resolved_board = urlsplit(job["apply_url"]).path.strip("/").split("/")[0]
+                        job["destination_provenance"] = destination_provenance(
+                            job["apply_url"], "lever_board",
+                            f"https://api.lever.co/v0/postings/{resolved_board}?mode=json")
                         job["ats"] = "lever"
                         job["closed"] = False
                         job["lever_resolution"] = "Unique exact title and compatible location on the configured public board"

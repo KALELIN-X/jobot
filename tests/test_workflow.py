@@ -2,12 +2,14 @@
 import asyncio
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from jobradar.app import create_app
+from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
@@ -36,10 +38,13 @@ def configure_and_approve(client):
 
 
 def add_job(client, identifier, score=95):
+    apply_url = f"https://jobs.lever.co/example/{uuid.uuid5(uuid.NAMESPACE_URL, identifier)}/apply"
+    detail_url = f"https://jobright.ai/jobs/info/synthetic-{identifier}"
     client.app.state.store.save_job({
         "id": identifier, "company": "Example", "title": "Python Backend Engineer",
         "location": "Boston, MA", "work_model": "On Site", "ats": "lever",
-        "apply_url": f"https://jobs.lever.co/example/{identifier}/apply",
+        "apply_url": apply_url, "source": "Jobright", "source_url": SOURCE_URL, "detail_url": detail_url,
+        "destination_provenance": destination_provenance(apply_url, "jobright_detail", detail_url),
         "description": "Build and maintain reliable Python backend services and REST APIs for customers.",
         "closed": False, "score": score,
         "score_detail": {"eligibility": [{"label": "Verified test condition", "status": "pass", "detail": "Synthetic test only"}]},

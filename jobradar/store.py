@@ -148,9 +148,16 @@ class Store:
     def save_job(self, job):
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute("SELECT status,attempted_at FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            existing = connection.execute("SELECT status,attempted_at,payload FROM jobs WHERE id=?", (job["id"],)).fetchone()
             status = existing["status"] if existing else job.get("status", "new")
             attempted = existing["attempted_at"] if existing else None
+            if existing:
+                previous = json.loads(existing["payload"])
+                # Discovery refreshes source fields, but cannot erase a worker's
+                # questions or recorded delivery evidence while the owner reviews it.
+                runtime_fields = {key: previous[key] for key in ("pending_questions", "confirmation", "message", "error", "applied_at")
+                                  if key in previous}
+                job = {**job, **runtime_fields}
             key = application_key(job)
             prior = connection.execute("SELECT job_id FROM destination_attempts WHERE application_key=?", (key,)).fetchone() if key else None
             externally_recorded = (prior and prior["job_id"].startswith("external:")) or self._identity_recorded(connection, job)

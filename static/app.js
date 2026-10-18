@@ -237,18 +237,44 @@
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
     const resumeReady = Boolean(state.resume?.loaded);
     const companies = list(state.rules?.companies);
-    const boardNames = Object.keys(state.rules?.company_boards || {}).map(name => name.toLowerCase());
-    const boardsReady = companies.length > 0 && companies.every(company => boardNames.includes(company.toLowerCase()));
-    const rulesReady = companies.length > 0 && boardsReady;
+    const anyCompany = companyScope(state.rules) === "any";
+    const rulesReady = (anyCompany || companies.length > 0) && list(state.rules?.allowed_ats).includes("lever");
     const approved = Boolean(state.approval?.approved);
     $("#readiness-title").textContent = approved ? "Ready when you are" : "Before your first run";
     $("#readiness-description").textContent = approved ? "Your saved rules are approved. You decide when to put them to work." : "A few essentials keep every application intentional.";
     const steps = [
       {title:"Add your profile & resume",description:profileReady && resumeReady ? "Your application essentials are saved." : "Give every application a solid foundation.",done:profileReady && resumeReady,view:"profile"},
-      {title:"Set your application rules",description:rulesReady ? `${companies.length} ${companies.length === 1 ? "company" : "companies"} with official Lever boards saved.` : companies.length ? "Map your companies to official Lever boards." : "Choose companies, locations, and limits.",done:rulesReady,view:"rules"},
+      {title:"Choose your preferences",description:rulesReady ? anyCompany ? "Any fetched company, within your job preferences." : `${companies.length} selected ${companies.length === 1 ? "company" : "companies"}.` : "Choose your preferences and enable supported applications.",done:rulesReady,view:"rules"},
       {title:"Review & approve",description:approved ? "Approved for applications within your rules." : "Give explicit approval before anything runs.",done:approved,view:"rules"}
     ];
     $("#readiness-steps").innerHTML = steps.map((step,index) => `<button type="button" class="readiness-step" data-view="${step.view}"><span class="step-number ${step.done ? "done" : ""}">${step.done ? icon("check") : String(index+1).padStart(2,"0")}</span><span class="step-copy"><strong>${step.title}</strong><small>${escape(step.description)}</small></span><span class="step-arrow">↗</span></button>`).join("");
+  }
+  function companyScope(rules = {}) {
+    return rules.company_scope || (list(rules.companies).length ? "selected" : "any");
+  }
+  function exactLines(value) {
+    return [...new Set(String(value || "").split(/\r?\n/).map(item => item.trim()).filter(Boolean))];
+  }
+  function locationMode(locations) {
+    const values = list(locations).map(value => value.toLowerCase().replace(/[^a-z]/g,""));
+    if (!values.length) return "any";
+    if (values.every(value => ["unitedstates","unitedstatesofamerica","usa","us"].includes(value))) return "us";
+    if (values.length === 1 && values[0] === "remote") return "remote";
+    return "custom";
+  }
+  function renderRuleForm() {
+    const form = $("#rules-form");
+    const selected = form.elements.company_scope.value === "selected";
+    $("#selected-companies-field").hidden = !selected;
+    form.elements.companies.disabled = !selected;
+    form.elements.companies.required = selected;
+    const custom = form.elements.location_mode.value === "custom";
+    $("#custom-locations-field").hidden = !custom;
+    form.elements.locations.disabled = !custom;
+    form.elements.locations.required = custom;
+    const experience = form.elements.max_required_experience_months;
+    const location = form.elements.location_mode;
+    $("#rules-preview").textContent = `${selected ? "Selected companies" : "Any fetched company"} · ${location.selectedOptions[0]?.textContent || "Any location"} · ${experience.selectedOptions[0]?.textContent || "Any experience level"} · ${form.elements.daily_limit.value || "—"} per day`;
   }
   function queueControlState(snapshot, unsaved = false) {
     const approved = snapshot.approval?.approved === true && !unsaved;
@@ -265,16 +291,16 @@
     if (!snapshot.profile?.name || !snapshot.profile?.email) return {view:"profile",selector:'#profile-form [name="name"]'};
     if (!snapshot.resume?.loaded) return {view:"profile",selector:"#resume-file"};
     const companies = list(snapshot.rules?.companies);
-    if (!companies.length) return {view:"rules",selector:'#rules-form [name="companies"]'};
-    const boards = Object.keys(snapshot.rules?.company_boards || {}).map(company => company.toLowerCase());
-    if (companies.some(company => !boards.includes(company.toLowerCase()))) return {view:"rules",selector:'#rules-form [name="company_boards"]'};
+    if (companyScope(snapshot.rules) === "selected" && !companies.length) return {view:"rules",selector:'#rules-form [name="companies"]'};
     if (!list(snapshot.rules?.allowed_ats).includes("lever")) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
-    return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="companies"]' : "#approval-acknowledge"};
+    return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="min_score"]' : "#approval-acknowledge"};
   }
   function openQueueReview() {
     const target = dirty.profile ? {view:"profile",selector:'#profile-form button[type="submit"]'} : dirty.rules ? {view:"rules",selector:'#rules-form button[type="submit"]'} : setupDestination(state);
     setView(target.view);
     const field = $(target.selector);
+    const details = field?.closest("details");
+    if (details) details.open = true;
     field?.scrollIntoView({block:"center",behavior:"smooth"});
     field?.focus({preventScroll:true});
   }
@@ -341,11 +367,13 @@
     const rules = approvalReview.rules;
     const profile = approvalReview.profile;
     const companies = list(rules.companies);
-    const fields = [["Applicant",profile.name || "Not saved"],["Legal first name",profile.first_name || "Not provided"],["Legal last name",profile.last_name || "Not provided"],["Preferred first name",profile.preferred_first_name || "Not provided"],["Email",profile.email || "Not saved"],["Approved work locations",list(profile.approved_work_locations).length ? list(profile.approved_work_locations).join("; ") : "None confirmed"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Approved companies",companies.length ? `${companies.length} selected` : "None selected"],["Official Lever boards",`${Object.keys(rules.company_boards || {}).length} mapped`],["Locations",list(rules.locations).length ? list(rules.locations).join(", ") : "Any location"],["Minimum fit",`${rules.min_score ?? "—"} / 100`],["Maximum required experience",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "No experience" : `${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["Prioritize new grads",rules.prefer_new_grad ? "Yes, ranking preference" : "No"],["Daily limit (UTC day)",`${rules.daily_limit ?? "—"} applications`],["Run interval",`${rules.interval_minutes ?? "—"} minutes`],["Allowed systems",list(rules.allowed_ats).length ? list(rules.allowed_ats).map(item => String(item).toUpperCase()).join(", ") : "None"],["Known eligibility",rules.require_known_eligibility === false ? "Not required" : "Required"]];
-    const boards = Object.entries(rules.company_boards || {}).map(([company,board]) => `${company} → ${board}`);
+    const selected = companyScope(rules) === "selected";
+    const fields = [["Applicant",profile.name || "Not saved"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Company scope",selected ? `${companies.length} selected companies` : "Any company from fetched jobs, including future matches"],["Location",list(rules.locations).length ? locationMode(rules.locations) === "us" ? "Anywhere in the U.S." : list(rules.locations).join(", ") : "Any location"],["Experience required",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "None" : `Up to ${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["New grads first",rules.prefer_new_grad ? "Yes" : "No"],["Minimum match",`${rules.min_score ?? "—"} / 100`],["Daily limit",`${rules.daily_limit ?? "—"} attempts (UTC day)`],["Schedule interval",`${rules.interval_minutes ?? "—"} minutes`],["Unclear eligibility",rules.require_known_eligibility === false ? "Review not required" : "Pause for review"]];
+    const applicantFields = [["Legal first name",profile.first_name],["Legal last name",profile.last_name],["Preferred name",profile.preferred_first_name],["Email",profile.email],["Phone",profile.phone],["Current location",profile.location],["Approved work locations",list(profile.approved_work_locations).join("; ")],["LinkedIn",profile.linkedin],["GitHub",profile.github],["Portfolio",profile.portfolio],["Skills",list(profile.skills).join(", ")],["Experience months",profile.experience_months],["Graduation",profile.graduation_date],["Work authorized",profile.work_authorized == null ? "Not provided" : profile.work_authorized ? "Yes" : "No"],["Sponsorship needed",profile.needs_sponsorship == null ? "Not provided" : profile.needs_sponsorship ? "Yes" : "No"]];
+    const applicantReview = applicantFields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value ?? "Not provided")}</strong></div>`).join("");
     const answerReview = Object.entries(profile.answers || {}).map(([question,answer]) => `<div class="approval-row"><span>${escape(question)}</span><strong>${escape(typeof answer === "boolean" ? answer ? "Yes" : "No" : answer)}</strong></div>`).join("");
     const stale = Boolean(approvalReview.fingerprint && approvalReview.fingerprint !== fingerprint);
-    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + (boards.length ? `<div class="approval-companies">Lever boards: ${escape(boards.join(" · "))}</div>` : "") + `<details class="approval-companies"><summary>Reusable answers (${Object.keys(profile.answers || {}).length})</summary>${answerReview || "No saved reusable answers."}</details>` + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
+    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (selected && companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + `<details class="approval-companies"><summary>Applicant details</summary>${applicantReview}</details>` + `<details class="approval-companies"><summary>Reusable answers (${Object.keys(profile.answers || {}).length})</summary>${answerReview || "No saved reusable answers."}</details>` + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
   }
   function renderAnswerMemory() {
     const memory = state.answer_memory || {pending:[],saved:Object.entries(state.profile?.answers || {}).map(([question,answer]) => ({question,answer}))};
@@ -432,7 +460,18 @@
     if (!dirty.rules && (!rulesForm.contains(document.activeElement) || !initialized.rules)) {
       const rules = state.rules || {};
       rulesForm.elements.companies.value = list(rules.companies).join("\n");
-      rulesForm.elements.company_boards.value = rules.company_boards && Object.keys(rules.company_boards).length ? JSON.stringify(rules.company_boards,null,2) : "";
+      rulesForm.elements.company_scope.value = companyScope(rules);
+      rulesForm.elements.location_mode.value = locationMode(rules.locations);
+      for (const name of ["max_required_experience_months","interval_minutes"]) {
+        const control = rulesForm.elements[name];
+        const value = rules[name] ?? "";
+        if (![...control.options].some(option => option.value === String(value))) {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = name === "interval_minutes" ? `${value} minutes` : `${value} months`;
+          control.append(option);
+        }
+      }
       rulesForm.elements.locations.value = list(rules.locations).join("\n");
       ["min_score","daily_limit","interval_minutes"].forEach(name => { if (rules[name] !== undefined && rules[name] !== null) rulesForm.elements[name].value = rules[name]; });
       rulesForm.elements.max_required_experience_months.value = rules.max_required_experience_months ?? "";
@@ -442,6 +481,7 @@
       $("#score-output").value = rulesForm.elements.min_score.value;
       initialized.rules = true;
     }
+    renderRuleForm();
   }
   function renderState() {
     const jobs = list(state.jobs);
@@ -451,7 +491,7 @@
     $("#stat-queue-caption").textContent = `${state.queue?.pending ?? stats.queued ?? 0} pending · ${state.queue?.blocked ?? 0} held by rules`;
     $("#stat-submitted").textContent = formatNumber(stats.submitted ?? jobs.filter(job => job.status === "submitted").length);
     $("#stat-attention").textContent = formatNumber(stats.needs_attention ?? jobs.filter(jobAttention).length);
-    $("#nav-queue-count").textContent = $("#stat-queued").textContent;
+    $("#nav-queue-count").textContent = formatNumber(state.queue?.pending ?? stats.queued ?? 0);
     $("#resume-status").textContent = state.resume?.loaded ? state.resume.filename || "Resume uploaded" : "No resume uploaded";
     $("#resume-status").classList.toggle("loaded",Boolean(state.resume?.loaded));
     $("#source-message").textContent = sourceMessage;
@@ -574,7 +614,7 @@
     action("history",$("button[type=submit]",form),async () => { await post("/api/applied-elsewhere",{url}); input.value = ""; },"Previous application recorded locally. This exact Lever posting will be skipped.");
   });
   $("#profile-form").addEventListener("input",() => markDirty("profile"));
-  $("#rules-form").addEventListener("input",() => { markDirty("rules"); $("#score-output").value = $("#min-score").value; });
+  $("#rules-form").addEventListener("input",() => { markDirty("rules"); $("#score-output").value = $("#min-score").value; renderRuleForm(); });
   $("#approval-acknowledge").addEventListener("change",renderControls);
   $("#profile-form").addEventListener("submit",event => {
     event.preventDefault();
@@ -598,15 +638,18 @@
   $("#rules-form").addEventListener("submit",event => {
     event.preventDefault();
     const form = event.currentTarget;
-    let companyBoards = {};
-    try {
-      companyBoards = form.elements.company_boards.value.trim() ? JSON.parse(form.elements.company_boards.value) : {};
-      if (!companyBoards || Array.isArray(companyBoards) || typeof companyBoards !== "object" || Object.values(companyBoards).some(value => typeof value !== "string" || !value.trim())) throw new Error();
-    } catch { showNotice('Company boards must be a JSON object mapping exact company names to official Lever board names, for example: {"Shield AI": "shieldai"}.',true); form.elements.company_boards.focus(); return; }
-    const body = {companies:splitLines(form.elements.companies.value),company_boards:companyBoards,locations:splitLines(form.elements.locations.value),allowed_ats:form.elements.allowed_ats.checked ? ["lever"] : [],min_score:Number(form.elements.min_score.value),daily_limit:Number(form.elements.daily_limit.value),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
+    const selected = form.elements.company_scope.value === "selected";
+    const where = form.elements.location_mode.value;
+    const locations = where === "us" ? ["United States","USA","U.S.","US"] : where === "remote" ? ["Remote"] : where === "custom" ? exactLines(form.elements.locations.value) : [];
+    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever"] : [],min_score:Number(form.elements.min_score.value),daily_limit:Number(form.elements.daily_limit.value),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
     body.max_required_experience_months = form.elements.max_required_experience_months.value === "" ? null : Number(form.elements.max_required_experience_months.value);
     body.prefer_new_grad = form.elements.prefer_new_grad.checked;
-    action("rules",$("button[type=submit]",form),async () => { await post("/api/rules",body); markSaved("rules"); },"Rules saved. Review the saved summary and give explicit approval to authorize applications.");
+    action("rules",$("button[type=submit]",form),async () => { const result = await post("/api/rules",body); markSaved("rules"); return result; },"Preferences saved. Review the updated summary to approve.").then(result => {
+      if (!result?.ok) return;
+      renderSummary(true);
+      renderControls();
+      if (currentView === "rules") $("#approval-title").scrollIntoView({block:"start",behavior:"smooth"});
+    });
   });
   $("#resume-file").addEventListener("change",event => { $("#resume-file-name").textContent = event.target.files[0]?.name || ""; });
   $("#resume-form").addEventListener("submit",event => {

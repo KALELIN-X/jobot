@@ -109,6 +109,7 @@ class Profile(StrictModel):
 
 
 class Rules(StrictModel):
+    company_scope: Literal["any", "selected"] = "any"
     companies: list[str] = Field(default_factory=list, max_length=30)
     company_boards: dict[str, str] = Field(default_factory=dict, max_length=10)
     locations: list[str] = Field(default_factory=list, max_length=30)
@@ -119,6 +120,13 @@ class Rules(StrictModel):
     daily_limit: int = Field(default=5, ge=1, le=20)
     interval_minutes: int = Field(default=360, ge=30, le=1440)
     require_known_eligibility: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_legacy_company_scope(cls, values):
+        if isinstance(values, dict) and "company_scope" not in values and values.get("companies"):
+            return {**values, "company_scope": "selected"}
+        return values
 
     @field_validator("companies", "locations")
     @classmethod
@@ -140,3 +148,8 @@ class Rules(StrictModel):
         if values not in ([], ["lever"]):
             raise ValueError("Allow Lever applications or leave automatic application systems disabled. Other systems are not supported.")
         return values
+
+
+def company_scope(rules: dict) -> str:
+    """Honor explicit scope and retain an older nonempty employer restriction."""
+    return rules.get("company_scope") or ("selected" if rules.get("companies") else "any")

@@ -14,6 +14,22 @@ def job(job_id="first", **changes):
     return {"id": job_id, "status": "new", "apply_url": URL, "title": "Original title", **changes}
 
 
+def test_feed_refresh_preserves_review_questions_and_confirmation_but_not_old_destinations(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    store.save_job(job(destination_provenance={"old": "source"}))
+    question = {"question": "Preferred editor?", "type": "text"}
+    store.update_job("first", "needs_attention", pending_questions=[question], confirmation="Recorded receipt", error="Review needed")
+    store.save_job(job(title="Fresh title", apply_url=None, destination_provenance=None))
+    saved = store.job("first")
+    assert saved["title"] == "Fresh title"
+    assert saved["status"] == "needs_attention"
+    assert saved["pending_questions"] == [question]
+    assert saved["confirmation"] == "Recorded receipt"
+    assert saved["error"] == "Review needed"
+    assert saved["apply_url"] is None
+    assert saved["destination_provenance"] is None
+
+
 @pytest.mark.parametrize("variant", [
     URL,
     URL.replace("jobs.lever.co", "JOBS.LEVER.CO"),

@@ -17,7 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
-from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules
+from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules, company_scope
 from .store import Store, now
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,7 +41,8 @@ def create_app(data_dir: Path | None = None):
     queue_lock = asyncio.Lock()
 
     def configuration():
-        return (store.get("profile", Profile().model_dump()), store.get("rules", Rules().model_dump()), store.get("resume", {}), store.get("approval", {}))
+        rules = Rules.model_validate(store.get("rules", {})).model_dump()
+        return (store.get("profile", Profile().model_dump()), rules, store.get("resume", {}), store.get("approval", {}))
 
     def approved():
         return valid_approval(*configuration())
@@ -144,8 +145,7 @@ def create_app(data_dir: Path | None = None):
                     if store.attempt_count(day) >= rules["daily_limit"]:
                         store.event("paused", "Daily submission-attempt limit reached (UTC day). The remaining queue is saved.")
                         break
-                    # The employer list is both a discovery preference and a submission boundary.
-                    if job.get("company", "").casefold() not in {company.casefold() for company in rules["companies"]}:
+                    if company_scope(rules) == "selected" and job.get("company", "").casefold() not in {company.casefold() for company in rules["companies"]}:
                         continue
                     reasons = job_problems(job, rules)
                     if reasons:
