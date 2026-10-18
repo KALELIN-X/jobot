@@ -107,6 +107,9 @@ def test_any_scope_can_run_newly_fetched_roles_from_multiple_employers(client, m
     monkeypatch.setattr("jobradar.autofill.run_application", synthetic_application)
     for identifier, company in [("first-board", "First Company"), ("second-board", "Second Company")]:
         client.app.state.store.save_job(fetched_job(identifier, company))
+    assert client.get("/api/state").json()["queue"]["matching"] == 2
+    assert client.get("/api/state").json()["queue"]["ready"] == 0
+    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 2
     assert client.get("/api/state").json()["queue"]["ready"] == 2
     assert client.post("/api/run", headers=HEADERS).status_code == 200
     state = await_idle(client)
@@ -128,6 +131,7 @@ def test_selected_scope_still_skips_other_employers(client, monkeypatch):
         return {"status": "submitted", "message": "Synthetic confirmation"}
 
     monkeypatch.setattr("jobradar.autofill.run_application", synthetic_application)
+    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 1
     assert client.get("/api/state").json()["queue"]["ready"] == 1
     assert client.post("/api/run", headers=HEADERS).status_code == 200
     await_idle(client)

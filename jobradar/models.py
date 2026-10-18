@@ -20,7 +20,7 @@ class AutomationRequest(StrictModel):
 
 
 class JobStatusRequest(StrictModel):
-    status: Literal["queued", "dismissed"]
+    status: Literal["new", "queued", "dismissed"]
 
 
 class ExternalApplicationRequest(StrictModel):

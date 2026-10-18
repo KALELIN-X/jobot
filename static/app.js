@@ -21,6 +21,10 @@
   let lastJobSignature = "";
   let lastEventSignature = "";
   let sourceMessage = "";
+  let lastSyncAt = null;
+  let connectionLost = false;
+  let lastInboxSignature = "";
+  const questionDrafts = new Map();
   let currentView = "queue";
   let approvalReview = null;
   let lastMemorySignature = "";
@@ -83,10 +87,13 @@
   }
   async function api(path, options = {}) {
     let response;
-    try { response = await fetch(path,{...options,headers:{"X-JobRadar-Client":"dashboard",...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}),...(options.headers || {})}}); }
-    catch { throw new Error("The local Jobot server is not responding. Check that it is running, then try again."); }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(),path === "/api/state" ? 6000 : 90000);
+    try { response = await fetch(path,{...options,signal:controller.signal,headers:{"X-JobRadar-Client":"dashboard",...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}),...(options.headers || {})}}); }
+    catch { clearTimeout(timeout); throw new Error(path === "/api/state" ? "The local server did not return a fresh status. Check that Jobot is running and refresh status." : "The request could not be confirmed. Check Activity and the current status before trying again."); }
     let data;
-    try { data = await response.json(); } catch { data = {}; }
+    try { data = await response.json(); } catch { if (controller.signal.aborted) throw new Error("The local server stopped responding before the response finished. Refresh status before retrying."); data = {}; }
+    finally { clearTimeout(timeout); }
     if (!response.ok) throw new Error(errorMessage(data,`Request could not be completed (${response.status}).`));
     return data;
   }
@@ -174,6 +181,10 @@
     return job.score_detail?.is_new_grad === true && (maximum === null || experienceVisible(job,maximum));
   }
   function compareJobs(a,b) {
+    const selected = Number(b.status === "queued") - Number(a.status === "queued");
+    if (selected) return selected;
+    const questions = Number(Boolean(b.unanswered_question_count || b.conflicting_answer_count)) - Number(Boolean(a.unanswered_question_count || a.conflicting_answer_count));
+    if (questions) return questions;
     const ready = Number(b.submission_check?.eligible === true) - Number(a.submission_check?.eligible === true);
     if (ready) return ready;
     if (state.rules?.prefer_new_grad) {
@@ -183,7 +194,7 @@
     return (Number.isFinite(Number(b.score)) && b.score !== null ? Number(b.score) : -1) - (Number.isFinite(Number(a.score)) && a.score !== null ? Number(a.score) : -1);
   }
   function renderJobs(force = false) {
-    const signature = JSON.stringify([state.jobs,state.rules,state.answer_memory?.pending,filter,search,experienceFilterEnabled]);
+    const signature = JSON.stringify([state.jobs,state.rules,state.answer_memory?.pending,state.run?.updated_at,filter,search,experienceFilterEnabled]);
     if (!force && signature === lastJobSignature) return;
     lastJobSignature = signature;
     const allJobs = list(state.jobs);
@@ -193,8 +204,8 @@
     $(".sort-label").innerHTML = state.rules?.prefer_new_grad ? "Ready, new grads, fit <span>↓</span>" : "Ready, then fit <span>↓</span>";
     const jobs = allJobs.filter(job => {
       const status = String(job.status || "").toLowerCase();
-      if (filter === "ready" && job.submission_check?.eligible !== true) return false;
-      if (filter === "queued" && !["new","queued"].includes(status)) return false;
+      if (filter === "ready" && job.submission_check?.matches_rules !== true) return false;
+      if (filter === "queued" && status !== "queued") return false;
       if (filter === "attention" && !jobAttention(job)) return false;
       if (filter === "submitted" && status !== "submitted") return false;
       if (maximum !== null && experienceFilterEnabled && !experienceVisible(job,maximum)) return false;
@@ -235,8 +246,14 @@
     const priorApplicationHelp = canRecordApplied && !supportedPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact supported posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
     const checks = list(job.submission_check?.blockers);
     const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-memory">Answer new application questions →</button>' : ""}` : "";
+    const pendingCount = list(state.answer_memory?.pending).filter(item => item.job_id === job.id).length;
+    const canAdd = job.queue_actions?.can_add === true;
+    const canRemove = job.queue_actions?.can_remove === true;
+    const quickActions = `<div class="job-quick-actions">${canAdd ? `<button type="button" class="button button-primary" data-action="queue" data-id="${escape(id)}">Add to queue ${icon("arrow")}</button>` : ""}${canRemove ? `<button type="button" class="button button-secondary" data-action="unqueue" data-id="${escape(id)}">Remove from queue</button>` : ""}${pendingCount ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(id)}">Review ${pendingCount} question${pendingCount === 1 ? "" : "s"}</button>` : ""}</div>`;
+    const active = state.run?.active_job?.id === job.id && ["running","stopping"].includes(state.run?.status);
+    const observed = active ? `<div class="card-worker-stage">${icon("activity")} ${escape(state.run.message)} · ${escape(fullDate(state.run.updated_at))}</div>` : "";
     const submissionInfo = isSubmitted ? [...new Set([job.message,job.confirmation,job.error].filter(Boolean).map(value => typeof value === "object" ? JSON.stringify(value) : String(value)))].join(" ") : "";
-    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.eligible === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div><div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${!hideJobActions && !isSubmitted && !["new","queued"].includes(status) ? `<button type="button" class="button button-secondary" data-action="queue" data-id="${escape(id)}">Add to queue${icon("arrow")}</button>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.matches_rules === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div>${quickActions}${observed}<div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
@@ -301,6 +318,11 @@
     return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="min_score"]' : "#approval-acknowledge"};
   }
   function openQueueReview() {
+    if (!dirty.profile && !dirty.rules && !list(state.setup_problems).length && state.approval?.approved && !state.queue?.queued) {
+      setView("queue");
+      showNotice("Your selected queue is empty. Use Add to queue on a role, or Queue matching roles.");
+      return;
+    }
     const target = dirty.profile ? {view:"profile",selector:'#profile-form button[type="submit"]'} : dirty.rules ? {view:"rules",selector:'#rules-form button[type="submit"]'} : setupDestination(state);
     setView(target.view);
     const field = $(target.selector);
@@ -315,13 +337,79 @@
     const problems = list(queue.blockers);
     const setup = list(state.setup_problems);
     $("#queue-run-title").textContent = control.running ? "Your queue is running" : setup.length ? "Finish your application setup" : !control.approved ? "Review your rules to start" : control.ready ? `${control.ready} role${control.ready === 1 ? " is" : "s are"} ready to apply` : "No eligible applications yet";
-    $("#queue-run-description").textContent = control.running ? "Follow results and any new questions in Activity and Answer memory." : setup.length ? "Use the next step below to unlock approval and queue runs." : !control.approved ? "Approve the saved details, then choose a one-time run or scheduled applications." : control.ready ? "A one-time run submits matching jobs. Scheduling is a separate option." : "Review each role’s submission checks or adjust your saved rules. Approval does not override a blocked role.";
+    $("#queue-run-description").textContent = control.running ? "The live worker panel below shows the employer and actual browser step. Questions appear in Activity." : setup.length ? "Complete the missing settings, then select the jobs you want." : !control.approved ? "Approval authorizes the saved profile, resume and answers. Saving a change resets it. Add jobs to your queue, then review and approve those details to run." : control.ready ? "Only selected queued jobs run. Scheduling can select future matching jobs when you explicitly enable it." : "Add a role using its Add to queue button. Held roles need their listed questions or requirements resolved before running.";
     const visibleProblems = dirty.profile || dirty.rules ? ["Save your profile or rule changes before approving.",...problems] : problems;
     $("#queue-blockers").innerHTML = visibleProblems.map(problem => `<li>${escape(problem)}</li>`).join("");
     $("#queue-blockers").hidden = !visibleProblems.length || control.running;
-    $("#queue-health").textContent = loaded ? `${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.pending ?? 0} pending · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
+    $("#queue-health").textContent = loaded ? `${queue.queued ?? 0} selected · ${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.matching ?? 0} matching discoveries · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
     $("#queue-review-button").textContent = setup.length ? "Complete setup →" : control.approved ? "Review rules →" : "Review & approve →";
     $("#queue-review-button").disabled = control.running;
+  }
+  function elapsedLabel(value) {
+    const stamp = dateObject(value);
+    if (!stamp) return "not recorded";
+    const seconds = Math.max(0,Math.floor((Date.now()-stamp.getTime())/1000));
+    return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds/60)}m ago`;
+  }
+  function progressPresentation(run = {}, disconnected = false) {
+    const active = ["running","stopping"].includes(run.status);
+    const statuses = {running:"Working",stopping:"Stopping",completed:"Finished",paused:"Paused",failed:"Failed",interrupted:"Interrupted",idle:"Idle"};
+    return {active,label:disconnected ? "Connection lost" : active && !run.worker_alive ? "Worker update delayed" : statuses[run.status] || "Idle",
+      title:disconnected ? "Showing the last received worker status" : run.active_job ? `${active ? "Working on" : "Last application"}: ${run.active_job.company}` : active ? "Starting the worker" : "No active application"};
+  }
+  function renderProgress() {
+    const run = state.run || {};
+    const view = progressPresentation(run,connectionLost);
+    $("#worker-title").textContent = view.title;
+    $("#worker-state").textContent = view.label;
+    $("#worker-panel").classList.toggle("is-running",view.active && !connectionLost && run.worker_alive === true);
+    $("#worker-panel").classList.toggle("is-offline",connectionLost);
+    $("#worker-mode").textContent = run.mode === "demo" ? " · LOCAL DEMO" : "";
+    $("#stop-run-button").hidden = !view.active;
+    $("#stop-run-button").disabled = connectionLost || run.status === "stopping" || busyActions.has("stop-run");
+    if (!run.id) {
+      $("#worker-content").innerHTML = `<p>No application is being worked on. Add roles to your queue, approve your saved details, then run.</p><p class="worker-sync">${connectionLost ? "The local server is not responding. Start Jobot or refresh status." : "Connected to the local server."}</p>${list(state.answer_memory?.pending).length ? '<button type="button" class="text-button" data-action="open-questions">Answer questions from the previous run →</button>' : ""}`;
+      return;
+    }
+    const job = list(state.jobs).find(item => item.id === run.active_job?.id);
+    const counts = Number.isInteger(run.field_count) ? `<span>${run.completed_fields ?? 0} / ${run.field_count} fields filled</span>` : "";
+    const pending = list(state.answer_memory?.pending).filter(item => item.job_id === run.active_job?.id).length;
+    const timeline = list(run.timeline).slice(-7).map(item => `<li><time>${escape(fullDate(item.at))}</time><span>${escape(item.message)}</span></li>`).join("");
+    const timelineOpen = $("#worker-content details")?.open === true;
+    const capture = job?.browser_capture_available ? `<a href="/api/jobs/${encodeURIComponent(job.id)}/screenshot" class="text-button" target="_blank" rel="noopener">View last browser capture ↗</a>` : "";
+    $("#worker-content").innerHTML = `${run.active_job ? `<p class="worker-role">${escape(run.active_job.title)}</p>` : ""}<div class="worker-current-step">${icon("activity")}<strong>${escape(run.message || "Waiting for an observed worker step")}</strong></div><div class="worker-counts">${counts}<span>${run.processed ?? 0} / ${run.total ?? 0} selected roles processed</span><span>${run.submitted ?? 0} confirmed · ${run.needs_attention ?? 0} need review · ${run.failed ?? 0} failed · ${run.uncertain ?? 0} uncertain</span></div><p class="worker-sync">${connectionLost ? `Connection lost. Last server contact ${elapsedLabel(new Date(lastSyncAt).toISOString())}. This is a saved status, not proof that the worker is still running.` : `${view.active ? `Worker heartbeat ${escape(elapsedLabel(run.heartbeat_at))}. ` : ""}Last observed step ${escape(elapsedLabel(run.updated_at))}.`}</p>${run.status === "stopping" ? '<p class="worker-sync">Stopping before the next submission. An application already sent cannot be undone.</p>' : ""}${job?.error ? `<p class="worker-error">${escape(job.error)}</p>` : ""}${pending ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(job.id)}">Review ${pending} question${pending === 1 ? "" : "s"} in Activity</button>` : ""}${capture}<details class="worker-timeline" ${timelineOpen ? "open" : ""}><summary>Observed steps from this run</summary><ol>${timeline || '<li>No browser step has been reported yet.</li>'}</ol></details>`;
+  }
+  function renderActivityQuestions() {
+    const pending = list(state.answer_memory?.pending);
+    const saved = list(state.answer_memory?.saved);
+    const signature = JSON.stringify([pending,saved]);
+    if (signature === lastInboxSignature) return;
+    lastInboxSignature = signature;
+    $("#activity-question-count").textContent = pending.length;
+    $("#nav-activity-questions").textContent = pending.length;
+    $("#nav-activity-questions").hidden = !pending.length;
+    const optionalOpen = $("#activity-question-list details")?.open === true;
+    const questionCard = item => {
+      const key = `${item.job_id}:${item.question}`;
+      const optionSignature = JSON.stringify([item.type,item.options]);
+      const storedDraft = questionDrafts.get(key);
+      const draft = storedDraft?.signature === optionSignature ? storedDraft.value : "";
+      const options = item.type === "checkbox" ? [{label:"Yes",value:"true"},{label:"No",value:"false"}] : list(item.options);
+      const multiple = /(?:mark|select|choose) all (?:that )?apply/i.test(item.question);
+      const unavailableChoice = ["select","radio"].includes(item.type) && (!options.length || multiple);
+      let controls;
+      if (unavailableChoice) controls = `<p class="question-unavailable">${multiple ? "This is a multiple-choice control the automatic worker cannot answer yet." : "The form did not expose supported choices for this control."} ${item.required ? "Open the employer form to review it manually." : "This question is optional and can be left blank."}</p>`;
+      else if (options.length && options.length <= 6) controls = `<fieldset class="question-options"><legend>Choose your answer</legend>${options.map((option,index) => `<label><input type="radio" name="choice" value="${index}" ${draft === String(index) ? "checked" : ""} required><span>${escape(option.label)}</span></label>`).join("")}</fieldset>`;
+      else if (options.length) controls = `<label class="field">Your answer<select name="choice" required><option value="">Choose an available answer</option>${options.map((option,index) => `<option value="${index}" ${draft === String(index) ? "selected" : ""}>${escape(option.label)}</option>`).join("")}</select></label>`;
+      else controls = `<label class="field">Your answer<textarea name="answer" rows="2" maxlength="4000" required placeholder="Enter an accurate answer to this question">${escape(draft)}</textarea></label>`;
+      return `<form class="activity-answer-form" data-job-id="${escape(item.job_id)}" data-question="${escape(item.question)}" data-options-signature="${escape(optionSignature)}"><div class="answer-context">${escape(item.company)} · ${escape(item.title)} · ${item.required ? "Required" : "Optional"}</div><h3>${escape(item.question)}</h3>${controls}<p class="field-hint">Saved for this exact question and shown in Rules. Review the updated approval before running again; confirming does not retry or submit the application.</p>${unavailableChoice ? externalLink(list(state.jobs).find(job => job.id === item.job_id)?.apply_url,"Open employer form") : `<button type="submit" class="button button-primary">Confirm &amp; remember answer ${icon("check")}</button>`}</form>`;
+    };
+    const required = pending.filter(item => item.required);
+    const optional = pending.filter(item => !item.required);
+    $("#activity-question-count").textContent = `${required.length} required · ${optional.length} optional`;
+    $("#activity-question-list").innerHTML = pending.length ? required.map(questionCard).join("") + (optional.length ? `<details class="optional-form-questions" ${optionalOpen ? "open" : ""}><summary>${optional.length} optional questions — you can leave these blank</summary>${optional.map(questionCard).join("")}</details>` : "") : '<p class="answer-empty">No unanswered application questions. New questions will appear here when a form needs your input.</p>';
+    $("#activity-saved-answer-list").innerHTML = `<details class="saved-answer-review"><summary>Confirmed answers (${saved.length})</summary>${saved.map((item,index) => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit</button></div>`).join("") || '<p class="answer-empty">No answers confirmed yet.</p>'}</details>`;
+    $("#rules-answer-list").innerHTML = saved.length ? saved.map(item => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div></div>`).join("") : '<p class="answer-empty">No confirmed answers yet. Answer employer questions in Activity as they appear.</p>';
   }
   function renderControls() {
     const approved = Boolean(state.approval?.approved);
@@ -332,6 +420,8 @@
     $("#profile-status").classList.toggle("ready",approved);
     $("#automation-status").innerHTML = `<span class="status-dot"></span>${running ? "Run in progress" : enabled ? "Automation on" : "Automation off"}`;
     $("#automation-status").classList.toggle("enabled",enabled || running);
+    $("#queue-matching-button").disabled = running || !state.queue?.matching || busyActions.has("queue-matching");
+    $("#queue-matching-button").textContent = `Queue matching roles (${state.queue?.matching ?? 0})`;
     const control = queueControlState(state,dirty.profile || dirty.rules);
     $("#run-button").disabled = !loaded || running || busyActions.has("run");
     $("#run-button").title = control.canRun ? "Run eligible applications once; scheduling stays separate" : "Review your setup and the visible queue blockers";
@@ -353,7 +443,7 @@
     $("#approve-button").disabled = approveDisabled;
     $("#approve-run-button").disabled = (approved ? running || dirty.profile || dirty.rules || busyActions.has("approve") : approveDisabled) || !state.queue?.ready || setupProblems.length > 0 || !(state.queue?.remaining_today > 0);
     $("#approve-run-button").innerHTML = `${approved ? "Run approved queue once" : "Approve &amp; run once"}${icon("play")}`;
-    $("#approval-run-help").textContent = setupProblems.length ? "Complete the missing settings above to unlock approval. Eligible roles are required for a one-time run." : !state.queue?.ready ? "No roles pass all current rules yet. You can save approval now; review role checks before running." : !(state.queue?.remaining_today > 0) ? "Today's attempt limit has been reached (UTC)." : "This submits eligible roles once. Scheduled applications stay a separate choice.";
+    $("#approval-run-help").textContent = setupProblems.length ? "Complete the missing settings above to unlock approval." : !state.queue?.queued ? "Choose jobs using Add to queue first. You can save approval separately." : !state.queue?.ready ? "Your selected roles are held. Answer their questions in Activity or review their checks." : !(state.queue?.remaining_today > 0) ? "Today's attempt limit has been reached (UTC)." : "This runs your selected eligible roles once. Scheduled applications stay a separate choice.";
     $("#approval-blockers").hidden = !setupProblems.length;
     $("#approval-blockers").innerHTML = `<strong>Complete these before approval</strong><ul>${setupProblems.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul><button type="button" class="text-button" data-action="review-queue">Go to the next missing setting →</button>`;
     $("#approval-title").textContent = reviewStale ? "This review is out of date" : approved ? "Your rules are approved" : "Review before you run";
@@ -494,13 +584,13 @@
     const stats = state.stats || {};
     $("#stat-total").textContent = formatNumber(stats.total ?? jobs.length);
     $("#stat-queued").textContent = formatNumber(state.queue?.ready ?? 0);
-    $("#stat-queue-caption").textContent = `${state.queue?.pending ?? stats.queued ?? 0} pending · ${state.queue?.blocked ?? 0} held by rules`;
+    $("#stat-queue-caption").textContent = `${state.queue?.queued ?? stats.queued ?? 0} selected · ${state.queue?.blocked ?? 0} held by rules`;
     $("#stat-submitted").textContent = formatNumber(stats.submitted ?? jobs.filter(job => job.status === "submitted").length);
     $("#stat-attention").textContent = formatNumber(stats.needs_attention ?? jobs.filter(jobAttention).length);
     $("#nav-queue-count").textContent = formatNumber(state.queue?.pending ?? stats.queued ?? 0);
     $("#resume-status").textContent = state.resume?.loaded ? state.resume.filename || "Resume uploaded" : "No resume uploaded";
     $("#resume-status").classList.toggle("loaded",Boolean(state.resume?.loaded));
-    const discoveryMessage = sourceMessage || state.discovery?.message || "";
+    const discoveryMessage = sourceMessage || (state.discovery?.count ? `Last fetch: ${state.discovery.count} listings · ${state.discovery.verified_destinations} verified supported links. Queue counts above reflect your current selection.` : "");
     $("#source-message").textContent = discoveryMessage;
     $("#source-message").hidden = !discoveryMessage;
     hydrateForms();
@@ -510,9 +600,11 @@
     renderJobs();
     renderAnswerMemory();
     renderActivity();
+    renderProgress();
+    renderActivityQuestions();
   }
   function refresh(manual = false) {
-    if (refreshing) return refreshInFlight;
+    if (refreshing) return manual ? refreshInFlight.then(() => refresh(true)) : refreshInFlight;
     refreshing = true;
     clearTimeout(pollTimer);
     refreshInFlight = (async () => {
@@ -520,16 +612,20 @@
         const next = await api("/api/state");
         const wasApproved = Boolean(state.approval?.approved);
         state = {...state,...next};
+        lastSyncAt = Date.now();
+        connectionLost = false;
         loaded = true;
         if (wasApproved && !state.approval?.approved) $("#approval-acknowledge").checked = false;
         renderState();
         return true;
       } catch (error) {
+        connectionLost = true;
+        renderProgress();
         if (!loaded || manual) showNotice(error.message,true);
         return false;
       } finally {
         refreshing = false;
-        pollTimer = setTimeout(() => refresh(),state.automation?.running ? 3000 : 8000);
+        pollTimer = setTimeout(() => refresh(),state.automation?.running ? 1000 : 5000);
       }
     })();
     return refreshInFlight;
@@ -545,6 +641,33 @@
     $(`#${name}-dirty`).hidden = true;
     $("#approval-acknowledge").checked = false;
   }
+  document.addEventListener("input",event => {
+    const form = event.target.closest(".activity-answer-form");
+    if (!form) return;
+    const value = form.elements.choice?.value ?? form.elements.answer?.value ?? "";
+    questionDrafts.set(`${form.dataset.jobId}:${form.dataset.question}`,{value,signature:form.dataset.optionsSignature});
+  });
+  document.addEventListener("submit",event => {
+    const form = event.target.closest(".activity-answer-form");
+    if (!form) return;
+    event.preventDefault();
+    if (dirty.profile) { showNotice("Save or discard your unsaved profile changes before confirming an application answer.",true); return; }
+    const item = list(state.answer_memory?.pending).find(candidate => candidate.job_id === form.dataset.jobId && candidate.question === form.dataset.question);
+    if (!item) { showNotice("This question changed. Refresh Activity before confirming an answer.",true); return; }
+    if (form.dataset.optionsSignature !== JSON.stringify([item.type,item.options])) { showNotice("The available choices changed. Review them and choose your answer again.",true); return; }
+    let answer;
+    if (form.elements.choice) {
+      const selected = Number(form.elements.choice.value);
+      const options = item.type === "checkbox" ? [{value:true},{value:false}] : list(item.options);
+      if (form.elements.choice.value === "" || !Number.isInteger(selected) || !options[selected]) return;
+      answer = options[selected].value;
+    } else answer = form.elements.answer.value.trim();
+    action(`question-${item.job_id}-${item.id || item.question}`,form.querySelector('button[type="submit"]'),async () => {
+      const result = await post("/api/answers",{question:item.question,answer,job_id:item.job_id});
+      questionDrafts.delete(`${item.job_id}:${item.question}`);
+      return result;
+    },"Answer confirmed and remembered for this exact question. It is now shown in Rules → Saved application answers. Review and approve the updated details before running again.");
+  });
   document.addEventListener("click", event => {
     const viewButton = event.target.closest("[data-view]");
     if (viewButton) { setView(viewButton.dataset.view); return; }
@@ -554,6 +677,16 @@
     const id = button.dataset.id;
     if (name === "review-queue") {
       openQueueReview();
+    } else if (name === "queue-matching") {
+      action("queue-matching",button,async () => { const result = await post("/api/queue/matching"); filter = "queued"; updateFilters(); return result; },result => result.message);
+    } else if (name === "stop-run") {
+      action("stop-run",button,() => post("/api/run/stop"),"Stop requested before the next submission. Scheduling is off; an already sent application cannot be undone.");
+    } else if (name === "refresh-worker") {
+      action("refresh-worker",button,() => refresh(true));
+    } else if (name === "open-questions") {
+      setView("activity");
+      const form = id ? [...document.querySelectorAll(".activity-answer-form")].find(item => item.dataset.jobId === id) : null;
+      (form || $("#activity-questions")).scrollIntoView({block:"start",behavior:"smooth"});
     } else if (name === "open-memory") {
       setView("profile");
       $("#answer-memory").scrollIntoView({block:"start",behavior:"smooth"});
@@ -575,8 +708,8 @@
       button.setAttribute("aria-expanded",String(open));
       button.innerHTML = `${open ? "Less detail" : "View details"}${icon("chevron")}`;
       if (detail) detail.hidden = !open;
-    } else if (name === "queue" || name === "dismiss") {
-      action(`job-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/status`,{status:name === "queue" ? "queued" : "dismissed"}),name === "queue" ? "Role added to your queue. Submission still follows your approved rules." : "Role dismissed.");
+    } else if (name === "queue" || name === "unqueue" || name === "dismiss") {
+      action(`job-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/status`,{status:name === "queue" ? "queued" : name === "unqueue" ? "new" : "dismissed"}),name === "queue" ? "Role added to your selected queue. Nothing is submitted until you run with approved details." : name === "unqueue" ? "Role removed from the queue and returned to discovery." : "Role dismissed.");
     } else if (name === "applied-elsewhere") {
       const job = list(state.jobs).find(item => String(item.id) === id);
       if (!job || isDemo(job) || job.attempted_at || ["submitted","applied_elsewhere","active","filling","submitting","applying","uncertain"].includes(String(job.status).toLowerCase())) return;

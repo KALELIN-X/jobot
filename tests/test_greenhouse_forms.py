@@ -196,6 +196,31 @@ def test_browser_saved_exact_custom_choice_is_reused(employer, tmp_path):
     assert receipts[0]["shift"] == b"Day"
 
 
+def test_browser_phone_country_commits_exact_country_with_matching_dial_code(employer, tmp_path, monkeypatch):
+    original = form_html
+    monkeypatch.setattr(__import__(__name__), "form_html", lambda variant: original(variant).replace('data-options="Canada|United States"', 'data-options="Canada +1|United States +1"'))
+    result, reservations, receipts, _ = run_fixture(employer, tmp_path)
+    assert result["status"] == "submitted", result
+    assert reservations == ["reserved"] and len(receipts) == 1
+    assert receipts[0]["country"] == b"United States +1"
+
+
+@pytest.mark.parametrize("phone,label,name,options", [
+    ("+445555555555", "Country", "country", ["United States +1"]),
+    ("5555550123", "Country", "country", ["United States +1"]),
+    ("", "Country", "country", ["United States +1"]),
+    ("+15555550123", "Country of residence", "country", ["United States +1"]),
+    ("+15555550123", "Country", "other", ["United States +1"]),
+    ("+15555550123", "Country", "country", ["United States +1", "United States +1"]),
+    ("+15555550123", "Country", "country", ["United States minor islands +1"]),
+])
+def test_phone_country_decoration_mapping_is_narrow_and_requires_unique_matching_phone(phone, label, name, options):
+    item = {"id": "country", "name": name, "label": label, "type": "select", "combobox": True, "visible": True,
+            "required": True, "options": [{"label": label, "value": label} for label in options]}
+    plan = plan_form([item], {"phone": phone, "answers": {label: "United States"}})
+    assert not plan.actions and plan.blockers
+
+
 def test_browser_searchable_location_requires_and_commits_an_exact_result(employer, tmp_path):
     profile = {**PROFILE, "answers": {**PROFILE["answers"], "Location (City)": "Boston, Massachusetts, United States"}}
     result, reservations, receipts, _ = run_fixture(employer, tmp_path, "search", profile)

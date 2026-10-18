@@ -127,7 +127,7 @@ class Store:
                 previous = json.loads(existing["payload"])
                 # Discovery refreshes source fields, but cannot erase a worker's
                 # questions or recorded delivery evidence while the owner reviews it.
-                runtime_fields = {key: previous[key] for key in ("pending_questions", "confirmation", "message", "error", "applied_at")
+                runtime_fields = {key: previous[key] for key in ("pending_questions", "confirmation", "message", "error", "applied_at", "screenshot")
                                   if key in previous}
                 job = {**job, **runtime_fields}
             key = application_key(job)

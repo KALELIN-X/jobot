@@ -84,6 +84,49 @@ test("runnable roles sort before held higher-scoring listings", () => {
   assert.equal(held.score,100);
 });
 
+test("selected queue and questions stay visible before unrelated discoveries", () => {
+  const helpers = dashboardHelpers();
+  const queued = {...job(0,false,60),status:"queued"};
+  const discovery = {...job(0,true,100),status:"new",submission_check:{eligible:true}};
+  const waiting = {...job(0,false,60),unanswered_question_count:2};
+  assert.ok(helpers.compareJobs(queued,discovery) < 0);
+  assert.ok(helpers.compareJobs(waiting,discovery) < 0);
+});
+
+test("progress distinguishes delayed or disconnected status from live work", () => {
+  const source = fs.readFileSync(path.join(__dirname,"..","static","app.js"),"utf8");
+  const start = source.indexOf("  function progressPresentation(");
+  const end = source.indexOf("  function renderProgress(",start);
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,end)+"\nthis.present = progressPresentation;",context);
+  const running = {status:"running",worker_alive:true,active_job:{company:"Example"}};
+  assert.equal(context.present(running).label,"Working");
+  assert.equal(context.present({...running,worker_alive:false}).label,"Worker update delayed");
+  assert.equal(context.present(running,true).label,"Connection lost");
+  assert.match(context.present({...running,status:"completed"}).title,/Last application/);
+  assert.equal(context.present({...running,status:"completed"}).active,false);
+});
+
+for (const phase of ["headers","body"]) test(`hung status ${phase} cannot leave stale work displayed indefinitely`,async () => {
+  const source = fs.readFileSync(path.join(__dirname,"..","static","app.js"),"utf8");
+  const start = source.indexOf("  async function api(");
+  const end = source.indexOf("  async function post(",start);
+  let expire;
+  const context = {AbortController,FormData,
+    setTimeout(callback,delay) {assert.equal(delay,6000);expire=callback;return 1;},clearTimeout(){},
+    fetch(_url,options) {
+      const hung = () => options.signal.aborted ? Promise.reject(new Error("aborted")) : new Promise((_resolve,reject) => options.signal.addEventListener("abort",() => reject(new Error("aborted"))));
+      return phase === "headers" ? hung() : Promise.resolve({ok:true,json:hung});
+    }};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,end)+"\nthis.request = api;",context);
+  const request = context.request("/api/state");
+  await Promise.resolve();
+  expire();
+  await assert.rejects(request,/fresh status|stopped responding/);
+});
+
 test("history URL validation accepts exact Greenhouse and Lever routes only", () => {
   const source = fs.readFileSync(path.join(__dirname,"..","static","app.js"),"utf8");
   const start = source.indexOf("  function supportedPostingURL(");

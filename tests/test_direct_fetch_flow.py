@@ -105,20 +105,22 @@ def test_fetch_save_rank_exposes_genuine_ready_greenhouse_and_discovery_counts(c
     assert response.status_code == 200
     summary = response.json()
     assert calls == [100]
-    assert {key: summary[key] for key in ("count", "verified_destinations", "direct_links", "ready")} == {
-        "count": 1, "verified_destinations": 1, "direct_links": 1, "ready": 1}
+    assert {key: summary[key] for key in ("count", "verified_destinations", "direct_links", "matching", "ready")} == {
+        "count": 1, "verified_destinations": 1, "direct_links": 1, "matching": 1, "ready": 0}
     assert summary["sources"] == ["SimplifyJobs"]
     state = client.get("/api/state").json()
     assert state["discovery"] == summary
     assert state["last_fetch"]
-    assert state["queue"]["ready"] == 1
-    assert not state["queue"]["can_run"]  # Fetched eligibility does not grant approval.
+    assert state["queue"]["matching"] == 1
+    assert state["queue"]["ready"] == state["queue"]["queued"] == 0
+    assert not state["queue"]["can_run"]  # Discovery grants neither selection nor approval.
     saved = state["jobs"][0]
     assert saved["score"] >= 60
     assert saved["score_detail"]["experience_requirement"]["minimum_months"] == 0
     assert saved["score_detail"]["is_new_grad"] is True
     assert next(check for check in saved["score_detail"]["eligibility"] if check["label"] == "Graduation date")["status"] == "waived"
-    assert saved["submission_check"] == {"eligible": True, "blockers": []}
+    assert saved["submission_check"] == {"eligible": False, "matches_rules": True,
+                                          "blockers": ["Add this role to your queue before running it."]}
     assert client.app.state.store.job("direct-row")["score"] == saved["score"]
     assert "submission_check" not in client.app.state.store.job("direct-row")
 
@@ -140,6 +142,9 @@ def test_review_approval_does_not_dispatch_until_explicit_run(client, monkeypatc
     assert observed == []
     assert approve(client).status_code == 200
     state = client.get("/api/state").json()
+    assert state["queue"]["can_run"] is False
+    assert client.post("/api/jobs/direct-row/status", headers=HEADERS, json={"status": "queued"}).status_code == 200
+    state = client.get("/api/state").json()
     assert state["queue"]["can_run"] is True
     assert not state["automation"]["enabled"]
     assert observed == []
@@ -160,7 +165,8 @@ def test_review_approval_does_not_dispatch_until_explicit_run(client, monkeypatc
 def test_current_official_requirements_are_rechecked_before_browser_filling(client, monkeypatch, refresh_status, description):
     configure(client)
     mock_public_fetch(monkeypatch, [public_job()])
-    assert client.post("/api/fetch", headers=HEADERS).json()["ready"] == 1
+    assert client.post("/api/fetch", headers=HEADERS).json()["matching"] == 1
+    assert client.post("/api/jobs/direct-row/status", headers=HEADERS, json={"status": "queued"}).status_code == 200
     assert approve(client).status_code == 200
     refreshed = []
     async def recheck(job):
@@ -184,6 +190,7 @@ def test_approval_change_during_public_recheck_prevents_filling(client, monkeypa
     configure(client)
     mock_public_fetch(monkeypatch, [public_job()])
     client.post("/api/fetch", headers=HEADERS)
+    assert client.post("/api/jobs/direct-row/status", headers=HEADERS, json={"status": "queued"}).status_code == 200
     assert approve(client).status_code == 200
     async def changed_configuration(job):
         client.app.state.store.set("profile", {**PROFILE,"email":"updated@example.test"})
@@ -192,7 +199,7 @@ def test_approval_change_during_public_recheck_prevents_filling(client, monkeypa
     assert client.post("/api/run", headers=HEADERS).status_code == 200
     state = wait_idle(client)
     assert not state["approval"]["approved"]
-    assert client.app.state.store.job("direct-row")["status"] == "new"
+    assert client.app.state.store.job("direct-row")["status"] == "queued"
     assert state["queue"]["attempts_today"] == 0
 
 
@@ -200,7 +207,8 @@ def test_failed_posting_refreshes_have_a_per_run_network_budget(client, monkeypa
     configure(client)
     rows = [public_job(f"row-{i}", url=f"https://job-boards.greenhouse.io/example/jobs/{1234000+i}") for i in range(6)]
     mock_public_fetch(monkeypatch, rows)
-    assert client.post("/api/fetch", headers=HEADERS).json()["ready"] == 6
+    assert client.post("/api/fetch", headers=HEADERS).json()["matching"] == 6
+    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 6
     assert approve(client).status_code == 200
     checked = []
     async def unavailable(job):
@@ -210,7 +218,7 @@ def test_failed_posting_refreshes_have_a_per_run_network_budget(client, monkeypa
     assert client.post("/api/run", headers=HEADERS).status_code == 200
     state = wait_idle(client)
     assert len(checked) == RULES["daily_limit"] == 3
-    assert sum(job["status"] == "new" for job in state["jobs"]) == 3
+    assert sum(job["status"] == "queued" for job in state["jobs"]) == 3
     assert state["queue"]["attempts_today"] == 0
     assert any("verification budget" in event["message"] for event in state["events"])
 
@@ -240,6 +248,7 @@ def test_fetch_preserves_confirmed_delivery_evidence_and_blocks_cross_source_dup
     mock_public_fetch(monkeypatch, [first])
     assert client.post("/api/fetch", headers=HEADERS).status_code == 200
     store = client.app.state.store
+    assert client.post("/api/jobs/confirmed/status", headers=HEADERS, json={"status": "queued"}).status_code == 200
     assert store.claim_job("confirmed") is not None
     store.reserve_attempt("confirmed", "2020-01-01", 3)
     store.update_job("confirmed", "submitted", confirmation="Synthetic employer receipt", applied_at="2020-01-01T12:00:00+00:00")
@@ -280,6 +289,7 @@ def test_missing_or_unverified_destination_does_not_count_as_verified_or_ready(c
     assert summary["direct_links"] == (0 if missing == "apply_url" else 1)
     state = client.get("/api/state").json()
     assert state["queue"]["ready"] == 0
-    assert state["queue"]["blocked"] == 1
+    assert state["queue"]["blocked"] == 0
+    assert state["queue"]["discovery_blocked"] == 1
     assert not state["jobs"][0]["submission_check"]["eligible"]
     assert state["discovery"] == summary

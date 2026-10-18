@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 from .destinations import GREENHOUSE_HOSTS, LEVER_HOSTS, parse_destination
 from .form_adapters import GreenhouseTransport, SNAPSHOT_JS, choose_combobox, enrich_comboboxes
+from .progress import ProgressCallback, ProgressReporter
 
 
 _APPLY_PATH = re.compile(
@@ -279,6 +280,23 @@ def _option_match(options: list[dict], answer: Any) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _phone_country_option(item: dict, answer: Any, profile: dict) -> dict | None:
+    """Match a dial-code decoration only on the explicit phone-country control."""
+    if not (item.get("combobox") and _normal(item.get("label")) == "country" and _normal(item.get("name")) == "country" and isinstance(answer, str)):
+        return None
+    phone = re.sub(r"[\s().-]", "", str(profile.get("phone") or ""))
+    if not re.fullmatch(r"\+[1-9]\d{6,14}", phone):
+        return None
+    matches = []
+    for option in item.get("options", []):
+        if option.get("disabled"):
+            continue
+        match = re.fullmatch(re.escape(answer.strip()) + r"\s+\+([1-9]\d{0,3})", str(option.get("label", "")))
+        if match and phone.startswith("+" + match.group(1)):
+            matches.append(option)
+    return matches[0] if len(matches) == 1 else None
+
+
 def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None) -> FormPlan:
     """Build safe actions and human-review blockers from a DOM field snapshot.
 
@@ -336,7 +354,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             elif bool(item.get("checked")) != answer:
                 plan.actions.append(FieldAction(item["id"], "check", answer))
         elif item.get("tag") == "select" or kind == "select":
-            option = _option_match(item.get("options", []), answer)
+            option = _option_match(item.get("options", []), answer) or _phone_country_option(item, answer, profile)
             if option is None or str(option.get("value", "")) == "":
                 _pending_question(plan, item, reason="choice_unavailable")
                 plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
@@ -421,28 +439,36 @@ async def run_application(
     fixture: bool = False,
     before_submit: Callable[[], Awaitable[Any]] | None = None,
     fixture_transport: dict | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> dict:
     """Fill an approved form and, when fully cleared, click submit at most once.
 
     The caller must separately verify the employer, job fingerprint, profile, and
     user rule approvals.  ``before_submit`` must atomically reserve the attempt
     and revalidate those rules; returning ``False`` refuses the attempt.
+    ``on_progress`` receives best-effort stage/count events, never answers.
     """
+    progress = ProgressReporter(on_progress)
+
+    async def early_result(status: str, message: str) -> dict:
+        await progress.finish(status)
+        return {"status": status, "message": message}
+
     url = job.get("apply_url") or job.get("application_url") or job.get("url")
     try:
         validate_application_url(url, allowed_hosts, fixture=fixture)
     except (URLNotApproved, TypeError):
-        return {"status": "needs_attention", "message": "Application URL is not within the approved supported destinations."}
+        return await early_result("needs_attention", "Application URL is not within the approved supported destinations.")
     if resume_path is not None:
         resume_path = Path(resume_path).resolve()
         if not resume_path.is_file():
-            return {"status": "failed", "message": "The supplied resume file is unavailable."}
+            return await early_result("failed", "The supplied resume file is unavailable.")
     if fixture_transport is not None and not (fixture and job.get("demo") is True):
-        return {"status": "needs_attention", "message": "Local transport fixtures are restricted to synthetic demonstration jobs."}
+        return await early_result("needs_attention", "Local transport fixtures are restricted to synthetic demonstration jobs.")
     try:
         transport = GreenhouseTransport(url, resume_path, local_fixture=fixture_transport)
     except (ValueError, KeyError, OSError):
-        return {"status": "needs_attention", "message": "The hosted form transport could not be safely initialized."}
+        return await early_result("needs_attention", "The hosted form transport could not be safely initialized.")
     clicked = False
     screenshot = None
     page = None
@@ -452,7 +478,7 @@ async def run_application(
     submission_responses: list[int] = []
     final_request_count = 0
 
-    async def result(status: str, message: str, **extra) -> dict:
+    async def result(status: str, message: str, *, terminal: bool = True, **extra) -> dict:
         nonlocal screenshot
         if page is not None:
             try:
@@ -465,6 +491,8 @@ async def run_application(
         payload = {"status": status, "message": message, "pending_questions": pending_questions, **extra}
         if screenshot:
             payload["screenshot"] = screenshot
+        if terminal:
+            await progress.finish(status, pending_question_count=len(pending_questions), screenshot=screenshot)
         return payload
 
     try:
@@ -489,11 +517,14 @@ async def run_application(
                         if transport.enabled and request.method not in {"GET", "HEAD", "OPTIONS"}:
                             if clicked and request.method == "POST" and transport.is_submit_url(request.url) and final_request_count == 0:
                                 final_request_count += 1
+                                await progress.emit("submitting")
                                 await route.continue_()
+                                await progress.emit("awaiting_confirmation")
                                 return
                             if not request.is_navigation_request():
                                 upload_body = transport.prepare_upload(request.url, request.method, request.headers, request.post_data_buffer)
                                 if upload_body is not None:
+                                    await progress.emit("uploading_resume")
                                     await route.continue_(post_data=upload_body)
                                     return
                             blocked_requests.append("unapproved_transport")
@@ -508,6 +539,16 @@ async def run_application(
                         except URLNotApproved:
                             blocked_requests.append("destination")
                             await route.abort()
+                            return
+                        if clicked and request.method == "POST":
+                            if final_request_count:
+                                blocked_requests.append("duplicate_submission")
+                                await route.abort()
+                                return
+                            final_request_count += 1
+                            await progress.emit("submitting")
+                            await route.continue_()
+                            await progress.emit("awaiting_confirmation")
                             return
                     await route.continue_()
 
@@ -528,15 +569,18 @@ async def run_application(
                         submission_responses.append(response.status)
                 page.on("response", observe_response)
                 page.set_default_timeout(8000)
+                await progress.emit("opening_form")
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 loaded_document = True
                 validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
+                await progress.emit("inspecting_form")
                 await page.locator("input,select,textarea").first.wait_for(state="attached", timeout=10000)
 
                 async def snapshot() -> dict:
                     validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                     if blocked_requests:
                         raise URLNotApproved("An unapproved destination was blocked.")
+                    await progress.emit("inspecting_form")
                     current = await page.evaluate(_SNAPSHOT_JS, uuid.uuid4().hex)
                     if transport.upload_success:
                         for field in current.get("fields", []):
@@ -550,6 +594,7 @@ async def run_application(
 
                 state = await snapshot()
                 for _ in range(3):
+                    await progress.emit("checking_answers")
                     blockers = _form_blockers(state, url, allowed_hosts, fixture)
                     plan = plan_form(state["fields"], profile, resume_path)
                     pending_questions = plan.pending_questions
@@ -558,6 +603,10 @@ async def run_application(
                         return await result("needs_attention", " ".join(dict.fromkeys(blockers))[:1200])
                     if not plan.actions:
                         break
+                    field_actions = [action for action in plan.actions if action.kind != "file"]
+                    completed_fields = 0
+                    if field_actions:
+                        await progress.emit("filling_fields", field_count=len(field_actions), completed_fields=0)
                     for action in plan.actions:
                         validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                         if blocked_requests:
@@ -582,10 +631,14 @@ async def run_application(
                                     return await result("needs_attention", "The hosted form's verified resume upload could not be completed; review it manually.")
                             else:
                                 await control.set_input_files(action.value)
+                        if action.kind != "file":
+                            completed_fields += 1
+                            await progress.emit("filling_fields", field_count=len(field_actions), completed_fields=completed_fields)
                     state = await snapshot()
                 else:
                     return await result("needs_attention", "The application kept changing while fields were filled.")
 
+                await progress.emit("checking_answers")
                 final_plan = plan_form(state["fields"], profile, resume_path)
                 pending_questions = final_plan.pending_questions
                 blockers = _form_blockers(state, url, allowed_hosts, fixture) + final_plan.blockers
@@ -599,7 +652,7 @@ async def run_application(
                     return await result("needs_attention", "An atomic attempt reservation and approval recheck are required before submission.")
                 # Capture the review state before the reservation. No profile data
                 # enters logs, exception messages, or filenames.
-                await result("needs_attention", "Ready for final approval recheck.")
+                await result("needs_attention", "Ready for final approval recheck.", terminal=False)
                 state = await snapshot()
                 stamp = _fingerprint(state)
                 try:
@@ -631,7 +684,7 @@ async def run_application(
             finally:
                 await browser.close()
     except URLNotApproved:
-        return {"status": "uncertain" if clicked else "needs_attention", "message": "An unapproved application destination was blocked." + (" Do not retry automatically." if clicked else ""), **({"screenshot": screenshot} if screenshot else {})}
+        return await result("uncertain" if clicked else "needs_attention", "An unapproved application destination was blocked." + (" Do not retry automatically." if clicked else ""))
     except Exception:
         # Exception strings can contain field values or URLs; never persist them.
-        return {"status": "uncertain" if clicked else "failed", "message": "The single submission attempt could not be confirmed. Do not retry automatically." if clicked else "The browser could not complete the guarded application workflow; review it locally.", **({"screenshot": screenshot} if screenshot else {})}
+        return await result("uncertain" if clicked else "failed", "The single submission attempt could not be confirmed. Do not retry automatically." if clicked else "The browser could not complete the guarded application workflow; review it locally.")

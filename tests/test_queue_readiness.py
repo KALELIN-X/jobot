@@ -65,7 +65,7 @@ def test_pending_roles_are_not_misrepresented_as_submission_ready(client):
     assert not queue["can_run"]
     assert "approve" in " ".join(queue["blockers"])
     by_id = {job["id"]: job for job in state["jobs"]}
-    assert by_id["ready"]["submission_check"] == {"eligible": True, "blockers": []}
+    assert by_id["ready"]["submission_check"] == {"eligible": True, "matches_rules": True, "blockers": []}
     assert "Lever" in " ".join(by_id["unsupported"]["submission_check"]["blockers"])
     assert "minimum" in " ".join(by_id["low-fit"]["submission_check"]["blockers"])
     assert "submission_check" not in by_id["demo"]
@@ -79,7 +79,7 @@ def test_approved_but_empty_queue_returns_actionable_error_instead_of_started(cl
     configure(client)
     response = client.post("/api/run", headers=HEADERS)
     assert response.status_code == 409
-    assert "Fetch jobs" in response.json()["detail"]
+    assert "Queue all matching" in response.json()["detail"]
     assert not client.get("/api/state").json()["automation"]["running"]
 
 
