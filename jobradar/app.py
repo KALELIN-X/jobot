@@ -1,0 +1,411 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import io
+import os
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pypdf import PdfReader
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
+from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules
+from .store import Store, now
+
+ROOT = Path(__file__).resolve().parent.parent
+MAX_RESUME_BYTES = 5 * 1024 * 1024
+
+
+def ordered_queue(jobs, rules):
+    """Prefer explicitly identified new-grad listings without altering fit scores."""
+    prefer_new_grad = rules.get("prefer_new_grad", False)
+    return sorted(jobs, key=lambda job: (
+        bool(prefer_new_grad and (job.get("score_detail") or {}).get("is_new_grad") is True),
+        job["score"] if job.get("score") is not None else -1,
+    ), reverse=True)
+
+
+def create_app(data_dir: Path | None = None):
+    data_dir = data_dir or Path(os.environ.get("JOBRADAR_DATA_DIR", str(ROOT / "data")))
+    store = Store(data_dir / "jobradar.sqlite3")
+    store.recover()
+    state = {"running": False, "fetching": False, "task": None, "demo_running": False, "mock_tokens": set()}
+    queue_lock = asyncio.Lock()
+
+    def configuration():
+        return (store.get("profile", Profile().model_dump()), store.get("rules", Rules().model_dump()), store.get("resume", {}), store.get("approval", {}))
+
+    def approved():
+        return valid_approval(*configuration())
+
+    def worker_busy():
+        return state["running"] or state["demo_running"] or bool(state["task"] and not state["task"].done())
+
+    def invalidate():
+        store.set("approval", {"approved": False, "approved_at": None})
+        store.set("automation", {"enabled": False})
+        store.set("stop_requested", True)
+
+    def rank_all():
+        from .ranking import rank_job
+        profile, rules, resume, _ = configuration()
+        for job in store.jobs():
+            if job.get("demo"):
+                continue
+            detail = rank_job(job, profile, resume.get("text", ""), rules)
+            job.update(score=detail.get("score"), score_detail=detail)
+            store.save_job(job)
+
+    async def fetch():
+        from .ingest import enrich_lever_jobs, fetch_jobs
+        if state["fetching"]:
+            return {"message": "A fetch is already running."}
+        state["fetching"] = True
+        try:
+            store.event("fetch", "Checking Jobright's public software job list.")
+            jobs = await fetch_jobs(limit=40)
+            _, rules, _, _ = configuration()
+            jobs = await enrich_lever_jobs(jobs, rules.get("company_boards", {}))
+            for job in jobs:
+                store.save_job(job)
+            rank_all()
+            count = sum(bool(job.get("apply_url")) for job in jobs)
+            store.event("fetch", f"Refreshed {len(jobs)} listings; {count} have a verified employer application URL. Removed feed rows are not treated as closed jobs.")
+            store.set("last_fetch", now())
+            return {"count": len(jobs), "verified_destinations": count}
+        finally:
+            state["fetching"] = False
+
+    async def run_queue():
+        from .autofill import run_application
+        if queue_lock.locked():
+            return
+        async with queue_lock:
+            state["running"] = True
+            try:
+                _, queue_rules, _, _ = configuration()
+                for candidate in ordered_queue(store.jobs(), queue_rules):
+                    # Reload after the prior browser run: a user may have dismissed
+                    # this listing or a feed refresh may have changed its details.
+                    job = store.job(candidate["id"])
+                    if not job:
+                        continue
+                    if job.get("demo") or job["status"] not in ("new", "queued"):
+                        continue
+                    profile, rules, resume, approval = configuration()
+                    if not valid_approval(profile, rules, resume, approval) or not resume_intact(resume, data_dir):
+                        store.event("paused", "Queue paused: the profile, resume or rules need approval.")
+                        break
+                    day = datetime.now(timezone.utc).date().isoformat()
+                    if store.attempt_count(day) >= rules["daily_limit"]:
+                        store.event("paused", "Daily submission-attempt limit reached (UTC day). The remaining queue is saved.")
+                        break
+                    # The employer list is both a discovery preference and a submission boundary.
+                    if job.get("company", "").casefold() not in {company.casefold() for company in rules["companies"]}:
+                        continue
+                    reasons = job_problems(job, rules)
+                    if reasons:
+                        store.update_job(job["id"], "needs_attention", error=" ".join(reasons))
+                        continue
+                    if store.destination_attempted(job):
+                        store.update_job(job["id"], "needs_attention", error="This posting or a listing with the same employer and title is already recorded as applied. Review its recorded result; automatic retry is disabled.")
+                        continue
+                    if store.get("stop_requested", False):
+                        break
+                    job = store.claim_job(job["id"])
+                    if not job:
+                        continue
+                    expected = fingerprint(profile, rules, resume)
+                    expected_job = (job.get("apply_url"), job.get("title"), job.get("description"))
+
+                    async def before_submit(job_id=job["id"], expected_fingerprint=expected, expected_job_data=expected_job):
+                        latest_profile, latest_rules, latest_resume, latest_approval = configuration()
+                        if store.get("stop_requested", False):
+                            raise ValueError("Queue was stopped before submission.")
+                        if not valid_approval(latest_profile, latest_rules, latest_resume, latest_approval) or fingerprint(latest_profile, latest_rules, latest_resume) != expected_fingerprint:
+                            raise ValueError("Configuration changed; approve it before submitting.")
+                        if not resume_intact(latest_resume, data_dir):
+                            raise ValueError("Resume file changed; upload and approve it again.")
+                        fresh = store.job(job_id)
+                        if (fresh.get("apply_url"), fresh.get("title"), fresh.get("description")) != expected_job_data:
+                            raise ValueError("Job details changed during filling; recheck this application.")
+                        remaining = job_problems(fresh, latest_rules)
+                        if remaining:
+                            raise ValueError(" ".join(remaining))
+                        store.reserve_attempt(job_id, datetime.now(timezone.utc).date().isoformat(), latest_rules["daily_limit"])
+
+                    result = await run_application(job, profile, data_dir / "resumes" / resume["stored_name"], allowed_hosts={"jobs.lever.co", "jobs.eu.lever.co"}, artifacts_dir=data_dir / "artifacts" / job["id"], submit=True, before_submit=before_submit)
+                    result_status = result.get("status", "needs_attention")
+                    if result_status not in {"submitted", "needs_attention", "uncertain", "failed"}:
+                        result_status = "needs_attention"
+                    store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None)
+                    store.event(result_status, f"{job['company']} — {job['title']}: {result.get('message', result_status)}", job["id"])
+            except Exception as error:
+                # Don't print profile contents or requests into logs.
+                store.event("error", f"Queue stopped: {type(error).__name__}. Check Activity and the application state before retrying.")
+                store.recover()
+            finally:
+                state["running"] = False
+
+    async def scheduler():
+        next_run = 0.0
+        while True:
+            await asyncio.sleep(5)
+            if not store.get("automation", {}).get("enabled") or not approved() or worker_busy():
+                continue
+            clock = asyncio.get_running_loop().time()
+            if clock < next_run:
+                continue
+            _, rules, _, _ = configuration()
+            next_run = clock + rules["interval_minutes"] * 60
+            try:
+                await fetch()
+                if not worker_busy() and store.get("automation", {}).get("enabled") and approved():
+                    await run_queue()
+            except Exception as error:
+                store.event("error", f"Scheduled fetch failed ({type(error).__name__}). Existing submissions will not be retried.")
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # Resume only an explicitly enabled, still-approved schedule. A normal
+        # shutdown's temporary stop flag must not silently stall that schedule.
+        store.set("stop_requested", not (store.get("automation", {}).get("enabled", False) and approved()))
+        scheduler_task = asyncio.create_task(scheduler())
+        yield
+        store.set("stop_requested", True)
+        scheduler_task.cancel()
+        if state["task"] and not state["task"].done():
+            state["task"].cancel()
+        tasks = [scheduler_task] + ([state["task"]] if state["task"] else [])
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    app = FastAPI(title="JobRadar", lifespan=lifespan, docs_url="/api/docs")
+    app.state.store = store
+    app.state.data_dir = data_dir
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+
+    @app.middleware("http")
+    async def local_boundary(request, call_next):
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            expected = f"{request.url.scheme}://{request.headers.get('host')}"
+            # Intercepted mock browser navigations use an opaque Origin. Only the
+            # synthetic sink accepts it, and that sink requires a one-use form token.
+            mock_origin = origin == "null" and request.url.path == "/mock/thanks"
+            if origin and origin != expected and not mock_origin:
+                return JSONResponse({"detail": "Only requests from this local app are accepted."}, status_code=403)
+            if request.url.path.startswith("/api/") and request.headers.get("x-jobradar-client") != "dashboard":
+                return JSONResponse({"detail": "Missing local dashboard request header."}, status_code=403)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+        if request.url.path.startswith("/api/"):
+            response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        return response
+
+    @app.get("/")
+    def index():
+        return FileResponse(ROOT / "static" / "index.html")
+
+    @app.get("/api/state")
+    def get_state():
+        profile, rules, resume, approval = configuration()
+        jobs = store.jobs()
+        real_jobs = [job for job in jobs if not job.get("demo")]
+        return {"profile": profile, "rules": rules, "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")}, "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"), "candidate_fingerprint": fingerprint(profile, rules, resume)}, "jobs": jobs, "events": store.events(), "stats": {"total": len(real_jobs), "queued": sum(job["status"] in ("new", "queued") for job in real_jobs), "submitted": sum(job["status"] == "submitted" for job in real_jobs), "needs_attention": sum(job["status"] in ("needs_attention", "uncertain", "failed") for job in real_jobs)}, "automation": {"enabled": store.get("automation", {}).get("enabled", False), "running": state["running"] or state["demo_running"], "fetching": state["fetching"]}, "last_fetch": store.get("last_fetch"), "setup_problems": setup_problems(profile, rules, resume)}
+
+    @app.post("/api/profile")
+    async def save_profile(profile: Profile):
+        store.set("profile", profile.model_dump())
+        invalidate()
+        rank_all()
+        store.event("profile", "Profile saved. Previous submission approval was revoked.")
+        return {"ok": True}
+
+    @app.post("/api/rules")
+    async def save_rules(rules: Rules):
+        store.set("rules", rules.model_dump())
+        invalidate()
+        rank_all()
+        store.event("rules", "Rules saved. Review and approve this configuration before submissions.")
+        return {"ok": True}
+
+    @app.post("/api/resume")
+    async def upload_resume(file: UploadFile = File(...)):
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in {".pdf", ".txt"}:
+            raise HTTPException(400, "Upload a PDF or UTF-8 text resume.")
+        contents = await file.read(MAX_RESUME_BYTES + 1)
+        if len(contents) > MAX_RESUME_BYTES:
+            raise HTTPException(413, "Resume exceeds the 5 MB limit.")
+        if not contents:
+            raise HTTPException(400, "The resume is empty.")
+        try:
+            if suffix == ".pdf":
+                if not contents.startswith(b"%PDF-"):
+                    raise ValueError("Not a PDF")
+                reader = PdfReader(io.BytesIO(contents))
+                if reader.is_encrypted or len(reader.pages) > 50:
+                    raise ValueError("Encrypted or too many pages")
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            else:
+                text = contents.decode("utf-8-sig")
+        except Exception:
+            raise HTTPException(400, "Couldn't read that resume. Use an unencrypted, text-based PDF or UTF-8 .txt file.")
+        if not text.strip() or len(text) > 100_000 or "\x00" in text:
+            raise HTTPException(400, "Resume text is empty, malformed, or exceeds 100,000 characters. Image-only PDFs need text extraction first.")
+        directory = data_dir / "resumes"
+        directory.mkdir(parents=True, exist_ok=True)
+        stored_name = uuid.uuid4().hex + suffix
+        (directory / stored_name).write_bytes(contents)
+        store.set("resume", {"loaded": True, "filename": Path(file.filename).name, "stored_name": stored_name, "sha256": hashlib.sha256(contents).hexdigest(), "text": text})
+        invalidate()
+        rank_all()
+        store.event("resume", "Resume saved locally. Previous submission approval was revoked.")
+        return {"ok": True}
+
+    @app.post("/api/approve")
+    async def approve(body: ApprovalRequest):
+        if body.acknowledge is not True:
+            raise HTTPException(400, "Review and acknowledge the exact profile, resume and employer rules first.")
+        profile, rules, resume, _ = configuration()
+        if body.expected_fingerprint != fingerprint(profile, rules, resume):
+            raise HTTPException(409, "Settings changed since your review. Reload and review the current profile, resume and rules.")
+        problems = setup_problems(profile, rules, resume)
+        if not resume_intact(resume, data_dir):
+            problems.append("The uploaded resume file is missing or changed.")
+        if problems:
+            raise HTTPException(400, " ".join(problems))
+        store.set("approval", {"approved": True, "approved_at": now(), "fingerprint": fingerprint(profile, rules, resume)})
+        store.set("stop_requested", False)
+        store.event("approval", "Auto-submit approved for the exact current profile, resume, employers, destinations and limits.")
+        return {"ok": True}
+
+    @app.post("/api/fetch")
+    async def fetch_endpoint():
+        try:
+            return await fetch()
+        except Exception as error:
+            store.event("error", f"Public job fetch failed ({type(error).__name__}). Try again later; saved jobs are intact.")
+            raise HTTPException(502, "Couldn't refresh the public job source. Saved jobs are still available.")
+
+    @app.post("/api/run")
+    async def run_endpoint():
+        if not approved():
+            raise HTTPException(409, "Approve your verified profile, resume and submission rules first.")
+        if worker_busy():
+            raise HTTPException(409, "The queue is already running.")
+        store.set("stop_requested", False)
+        state["running"] = True
+        state["task"] = asyncio.create_task(run_queue())
+        return {"message": "Approved queue started."}
+
+    @app.post("/api/automation")
+    async def automation_endpoint(body: AutomationRequest):
+        enabled = body.enabled
+        if enabled and not approved():
+            raise HTTPException(409, "Approve the current profile and rules before enabling automation.")
+        store.set("automation", {"enabled": enabled})
+        store.set("stop_requested", not enabled)
+        store.event("automation", "Scheduled automation enabled while this app is running." if enabled else "Automation stopped; an in-flight click may already have completed. Check its recorded result.")
+        return {"ok": True}
+
+    @app.post("/api/jobs/{job_id}/status")
+    async def job_status(job_id: str, body: JobStatusRequest):
+        status = body.status
+        job = store.job(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        if job["status"] in {"filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or job.get("attempted_at"):
+            raise HTTPException(409, "An active or attempted application cannot be requeued automatically. Verify its outcome first.")
+        store.update_job(job_id, status, error=None)
+        return {"ok": True}
+
+    @app.post("/api/applied-elsewhere")
+    async def applied_elsewhere(body: ExternalApplicationRequest):
+        try:
+            result = store.record_external_application(url=body.url, job_id=body.job_id)
+        except LookupError as error:
+            raise HTTPException(404, str(error))
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+        if result["recorded"] or result["updated_jobs"]:
+            message = "A previous application was recorded. Listings with the same employer and title are held for review, including possible reposts." if result.get("identity_key") else "A previously submitted Lever posting was recorded. Matching listings will not be submitted automatically."
+            store.event("applied_elsewhere", message)
+        return {"ok": True, **result}
+
+    async def demo(base_url):
+        from .autofill import run_application
+        state["demo_running"] = True
+        job_id = "demo-" + uuid.uuid4().hex[:12]
+        job = {"id": job_id, "company": "Local demo employer", "title": "Backend engineer · synthetic application", "location": "Local mock form", "ats": "local demo", "apply_url": base_url + "/mock/apply", "description": "Synthetic test only. No real employer receives data.", "score": None, "score_detail": {"matches": [], "not_evidenced": [], "eligibility": [], "reasons": ["Local fixture: no real resume or employer."]}, "status": "new", "demo": True}
+        store.save_job(job)
+        store.update_job(job_id, "filling")
+        store.event("demo", "Starting a synthetic application on this computer only.", job_id)
+        try:
+            path = data_dir / "demo-resume.txt"
+            path.write_text("Synthetic demo resume. Alex Example: Java, REST APIs, AWS. No real person or credentials.", encoding="utf-8")
+            profile = Profile(name="Alex Example", email="alex@example.test", phone="555-0100", current_company="Example Studio", location="Boston, MA").model_dump()
+
+            async def before_submit():
+                store.reserve_attempt(job_id, "demo-only", 1_000_000)
+
+            result = await run_application(job, profile, path, allowed_hosts={"127.0.0.1"}, artifacts_dir=data_dir / "artifacts" / job_id, submit=True, fixture=True, before_submit=before_submit)
+            store.update_job(job_id, result["status"], message=result.get("message"), error=None if result["status"] == "submitted" else result.get("message"), confirmation=result.get("confirmation"))
+            store.event("demo", f"Local mock application: {result.get('message', result['status'])}", job_id)
+        except Exception as error:
+            store.update_job(job_id, "failed", error=f"Demo failed ({type(error).__name__}). Verify browser installation.")
+            store.event("error", "Local demo failed. Run the documented Playwright browser installation and try again.", job_id)
+        finally:
+            state["demo_running"] = False
+
+    @app.post("/api/demo")
+    async def demo_endpoint(request: Request):
+        if worker_busy():
+            raise HTTPException(409, "A local demo is already running.")
+        base_url = str(request.base_url).rstrip("/")
+        # The fixture runner is deliberately loopback-only even if Host is localhost.
+        base_url = base_url.replace("http://localhost:", "http://127.0.0.1:")
+        state["demo_running"] = True
+        state["task"] = asyncio.create_task(demo(base_url))
+        return {"message": "Local mock application started. No real employer will receive data."}
+
+    @app.get("/mock/apply", response_class=HTMLResponse)
+    def mock_form(variant: str = "standard"):
+        token = uuid.uuid4().hex
+        if len(state["mock_tokens"]) > 100:
+            state["mock_tokens"].clear()
+        state["mock_tokens"].add(token)
+        extra = '<label>Secret project experience <input name="secret_experience" required></label>' if variant == "unknown" else '<label><input type="checkbox" name="terms" required> I agree to the terms and certify this application</label>' if variant == "agreement" else ''
+        return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Local mock application</title><style>body{{font:16px system-ui;max-width:650px;margin:60px auto;padding:24px;background:#f5f6f8}}form{{display:grid;gap:20px;background:white;padding:32px;border-radius:20px}}label{{display:grid;gap:8px}}input,button{{padding:12px;font:inherit}}small{{color:#596777}}</style></head><body><h1>Local mock employer</h1><p>Synthetic application fixture. This is not a job opening.</p><form method="post" enctype="multipart/form-data" action="/mock/thanks"><input type="hidden" name="mock_token" value="{token}"><label>Full name <input name="name" required></label><label>Email <input name="email" type="email" required></label><label>Phone <input name="phone"></label><label>Current company <input name="org"></label><label>Current location <input name="location"></label><label>Resume/CV <input type="file" name="resume" required></label>{extra}<button type="submit">Submit application</button></form></body></html>'''
+
+    @app.post("/mock/thanks", response_class=HTMLResponse)
+    async def mock_submit(request: Request):
+        form = await request.form()
+        # Only the synthetic demo identity can be sent to this test sink.
+        if form.get("name") != "Alex Example" or form.get("email") != "alex@example.test":
+            raise HTTPException(400, "This fixture accepts the synthetic demo identity only.")
+        attachment = form.get("resume")
+        if not hasattr(attachment, "read") or not (await attachment.read()).startswith(b"Synthetic demo resume."):
+            raise HTTPException(400, "A synthetic resume attachment is required.")
+        token = form.get("mock_token")
+        if token not in state["mock_tokens"]:
+            raise HTTPException(403, "The mock form token is missing or already used.")
+        state["mock_tokens"].remove(token)
+        receipt = store.receipt("Alex Example", "alex@example.test")
+        return f'<html lang="en"><head><title>Application submitted — local demo</title></head><body><h1>Your application has been submitted</h1><p>Local demo confirmation #{receipt}. No real employer was contacted.</p></body></html>'
+
+    app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+    return app
+
+
+app = create_app()
