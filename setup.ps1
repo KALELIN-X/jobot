@@ -40,6 +40,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ''
-Write-Host 'Setup complete. Launch with:'
+Write-Host 'Jobot setup complete. Launch with:'
 Write-Host '  powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1'
 Write-Host 'Then open http://127.0.0.1:8765/ in your browser.'

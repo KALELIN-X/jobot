@@ -81,7 +81,7 @@
   async function api(path, options = {}) {
     let response;
     try { response = await fetch(path,{...options,headers:{"X-JobRadar-Client":"dashboard",...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}),...(options.headers || {})}}); }
-    catch { throw new Error("The local JobRadar server is not responding. Check that it is running, then try again."); }
+    catch { throw new Error("The local Jobot server is not responding. Check that it is running, then try again."); }
     let data;
     try { data = await response.json(); } catch { data = {}; }
     if (!response.ok) throw new Error(errorMessage(data,`Request could not be completed (${response.status}).`));
@@ -402,7 +402,7 @@
       const job = list(state.jobs).find(item => String(item.id) === id);
       if (!job || isDemo(job) || job.attempted_at || ["submitted","applied_elsewhere","active","filling","submitting","applying","uncertain"].includes(String(job.status).toLowerCase())) return;
       const canonical = Boolean(leverPostingURL(job.apply_url));
-      action(`job-${id}`,button,() => post("/api/applied-elsewhere",{job_id:id}),canonical ? "Previous application recorded. JobRadar will skip this exact Lever posting." : "Previous application recorded. Listings with the same company and title will be held for review.");
+      action(`job-${id}`,button,() => post("/api/applied-elsewhere",{job_id:id}),canonical ? "Previous application recorded. Jobot will skip this exact Lever posting." : "Previous application recorded. Listings with the same company and title will be held for review.");
     } else if (name === "demo") {
       action("demo",button,async () => { await post("/api/demo"); setView("queue"); },"Local demo created. It uses a mock employer and sends no application to a real company.");
     } else if (name === "review-refresh") {

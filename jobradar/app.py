@@ -186,7 +186,7 @@ def create_app(data_dir: Path | None = None):
         tasks = [scheduler_task] + ([state["task"]] if state["task"] else [])
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    app = FastAPI(title="JobRadar", lifespan=lifespan, docs_url="/api/docs")
+    app = FastAPI(title="Jobot", lifespan=lifespan, docs_url="/api/docs")
     app.state.store = store
     app.state.data_dir = data_dir
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])

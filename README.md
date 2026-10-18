@@ -1,4 +1,4 @@
-# JobRadar
+# Jobot
 
 A private, local job-search workspace: fetch software engineering listings from Jobright's public GitHub list, compare job descriptions against your resume, and fill and submit supported applications under rules you explicitly approve.
 
@@ -6,33 +6,33 @@ This is a newly built project. Its automated browser worker has been verified ag
 
 ## First-time setup (Windows PowerShell)
 
-The [GitHub repository](https://github.com/KALELIN-X/job-radar) stores the source code. GitHub does not run this app or submit applications for you; JobRadar runs locally on your Windows computer.
+The [GitHub repository](https://github.com/KALELIN-X/jobot) stores the source code. GitHub does not run this app or submit applications for you; Jobot runs locally on your Windows computer.
 
 Install **Git for Windows** and **Python 3.12+** first. Python 3.12 is the tested version. Open PowerShell in the parent folder where you want to keep the project, then run these commands one at a time:
 
 ```powershell
-git clone https://github.com/KALELIN-X/job-radar.git
-cd job-radar
+git clone https://github.com/KALELIN-X/jobot.git
+cd jobot
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-If the repository is private, sign in to GitHub with an account that has access when Git asks. Do not put a password or access token in the clone URL. If you already have this checkout, open PowerShell in its `job-radar` folder and run only the setup command.
+If the repository is private, sign in to GitHub with an account that has access when Git asks. Do not put a password or access token in the clone URL. If you already have this checkout, open PowerShell in its current project folder (`job-radar` for the earlier checkout) and run only the setup command.
 
 Setup creates the local Python environment, installs the pinned dependencies, and downloads the Playwright browser used for supported forms. Internet access is needed for setup, fetching listings, and real applications. No paid service, AI subscription, API key, or browser extension is required. There is no frontend build step.
 
 ## Daily launch
 
-Open PowerShell in the `job-radar` folder and run:
+Open PowerShell in your project folder (`jobot` for a new clone, or the existing `job-radar` checkout) and run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-After the server starts, open [JobRadar on this computer](http://127.0.0.1:8765/) in your browser. The launcher prints this address but does not open a tab for you. This loopback address works only on the computer running the app. If JobRadar is already running, the launcher reports that and returns rather than starting a second server; keep the original server window open.
+After the server starts, open [Jobot on this computer](http://127.0.0.1:8765/) in your browser. The launcher prints this address but does not open a tab for you. This loopback address works only on the computer running the app. If Jobot is already running, the launcher reports that and returns rather than starting a second server; keep the original server window open.
 
 **Keep that PowerShell window open.** Closing it or pressing Ctrl+C stops the server and scheduling. Keep the computer awake and online while a run or schedule is active; a browser tab alone does not keep the app running. This is not a Windows background service or cloud scheduler.
 
-On first launch, JobRadar starts the local dashboard only. It does not fetch jobs, run applications, or enable automation just because you installed or opened it. Use **Fetch jobs**, complete your profile and rules, review and approve the saved configuration, then explicitly choose **Run approved queue** or enable scheduled applications. On later launches, your profile and history load from the same local `data/` folder. A schedule you previously enabled resumes if its saved approval is still valid; turn automation off before closing the app if you do not want it to resume next time.
+On first launch, Jobot starts the local dashboard only. It does not fetch jobs, run applications, or enable automation just because you installed or opened it. Use **Fetch jobs**, complete your profile and rules, review and approve the saved configuration, then explicitly choose **Run approved queue** or enable scheduled applications. On later launches, your profile and history load from the same local `data/` folder. A schedule you previously enabled resumes if its saved approval is still valid; turn automation off before closing the app if you do not want it to resume next time.
 
 ## Start with the local demo
 
@@ -52,9 +52,9 @@ Use **Already applied** on a saved listing to record a previous application. Thi
 
 If the listing is absent, paste its exact HTTPS Lever posting/application URL into **Already applied elsewhere?** under Application rules. That blocks the canonical posting ID even if a matching row is fetched later, without consuming today's quota. Recording history never overwrites evidence of an active, uncertain, or confirmed submission.
 
-JobRadar cannot know about applications made outside the app until you record them. A different posting ID or changed employer/title may represent a repost that needs manual review. Do not rely on a one-time dismissal as a complete external-application history.
+Jobot cannot know about applications made outside the app until you record them. A different posting ID or changed employer/title may represent a repost that needs manual review. Do not rely on a one-time dismissal as a complete external-application history.
 
-Approval authorizes sharing your saved profile, approved answers, and selected resume with the exact configured employer application destinations when a job passes your rules. Uploads to JobRadar itself stay in local storage until an application runs. Do not upload employer-confidential material, credentials, or unrelated personal files.
+Approval authorizes sharing your saved profile, approved answers, and selected resume with the exact configured employer application destinations when a job passes your rules. Uploads to Jobot itself stay in local storage until an application runs. Do not upload employer-confidential material, credentials, or unrelated personal files.
 
 ## What the first version supports
 
@@ -119,7 +119,7 @@ Use a fresh `--basetemp` name if Windows temporary-folder permissions prevent py
 
 A fresh GitHub clone contains code, **not your profile, resume, or application history**. Those records live in the ignored local `data/` folder. A new empty `data/` folder cannot know about past applications, so duplicate protection depends on retaining your existing local history or recording previous applications again.
 
-Before moving the app or replacing a checkout, stop JobRadar with Ctrl+C and privately back up the entire `data/` folder. With the app stopped, restore that folder beside `start.ps1` in the new checkout before launching. Keep the backup in a private location; do not commit it, attach it to an issue, or upload it to a public repository. Stopping the server before copying avoids an incomplete SQLite backup. The `.venv/` folder does not need to be copied; rerun setup instead.
+Before moving the app or replacing a checkout, stop Jobot with Ctrl+C and privately back up the entire `data/` folder. With the app stopped, restore that folder beside `start.ps1` in the new checkout before launching. Keep the backup in a private location; do not commit it, attach it to an issue, or upload it to a public repository. Stopping the server before copying avoids an incomplete SQLite backup. The `.venv/` folder does not need to be copied; rerun setup instead.
 
 This is single-user local software. Do not expose its port publicly or deploy it as a shared website. It uses loopback binding, trusted-host checks, same-origin mutation checks, and a dashboard request header; it has no multi-user authentication. Use only where the relevant site's rules permit automation.
 
