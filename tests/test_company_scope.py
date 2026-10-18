@@ -131,8 +131,9 @@ def test_selected_scope_still_skips_other_employers(client, monkeypatch):
         return {"status": "submitted", "message": "Synthetic confirmation"}
 
     monkeypatch.setattr("jobradar.autofill.run_application", synthetic_application)
-    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 1
+    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 2
     assert client.get("/api/state").json()["queue"]["ready"] == 1
+    assert client.get("/api/state").json()["queue"]["blocked"] == 1
     assert client.post("/api/run", headers=HEADERS).status_code == 200
     await_idle(client)
     assert observed == ["First Company"]

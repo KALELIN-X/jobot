@@ -111,6 +111,19 @@ def test_unverified_input_never_makes_a_request(monkeypatch):
     assert result["candidate_refresh"]["status"] == "unverified"
 
 
+@pytest.mark.parametrize("status_code", [200, 404, 500])
+def test_current_or_unavailable_refresh_clears_stale_public_pay(monkeypatch, status_code):
+    job = fetched()
+    job.update(published_pay=[{"minimum": 100000, "maximum": 120000, "currency": "USD", "period": "year"}],
+               pay_description="Old published salary description")
+    original = copy.deepcopy(job)
+    calls = install_http(monkeypatch, lambda request: httpx.Response(status_code, json=payload(job)))
+    result = asyncio.run(refresh.refresh_candidate(job))
+    assert calls == [("GET", public_detail_url(job["apply_url"]))]
+    assert result["published_pay"] == [] and result["pay_description"] == ""
+    assert job == original
+
+
 def test_total_timeout_is_bounded_and_cached_capability_is_removed(monkeypatch):
     async def slow_read(endpoint):
         await asyncio.sleep(1)

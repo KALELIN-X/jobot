@@ -20,6 +20,7 @@ import httpx
 from . import ingest
 from .destinations import SIMPLIFY_SOURCE_URL, listing_binding, parse_destination, public_detail_url
 from .locations import country_is_us
+from .job_facts import published_pay
 
 MAX_JOBS = 100
 MAX_SOURCE_BYTES = 2_000_000
@@ -192,6 +193,13 @@ def employer_metadata(job: dict, payload: dict) -> dict:
     result = dict(job)
     result.update(title=title, description=description[:ingest.MAX_DESCRIPTION_CHARS],
                   description_source=f"Official {destination['ats'].title()} public posting", closed=False, fetch_error=None)
+    # Preserve only optional public pay fields, not the whole API response.
+    # Replacing on refresh prevents a removed range from surviving as stale data.
+    result["published_pay"] = published_pay(payload, destination["ats"])
+    result["pay_description"] = (_plain_content(payload.get("salaryDescriptionPlain") or payload.get("salaryDescription"))[:4000]
+                                 if destination["ats"] == "lever" else "")
+    if destination["ats"] == "lever" and payload.get("workplaceType") in {"on-site", "remote", "hybrid"}:
+        result["work_model"] = payload["workplaceType"]
     if isinstance(location, str) and location.strip():
         result["location"] = location.strip()[:1000]
         if us_location(location):

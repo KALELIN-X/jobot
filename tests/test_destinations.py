@@ -56,10 +56,48 @@ def test_fragment_cannot_evade_history_but_does_not_become_a_browser_capability(
 
 
 def test_public_metadata_url_is_derived_not_interpolated_from_caller_fields():
-    assert public_detail_url(GREENHOUSE) == "https://boards-api.greenhouse.io/v1/boards/example/jobs/1234567009?content=true"
+    assert public_detail_url(GREENHOUSE) == "https://boards-api.greenhouse.io/v1/boards/example/jobs/1234567009?content=true&pay_transparency=true"
     assert public_detail_url(LEVER) == "https://api.lever.co/v0/postings/example/12345678-abcd-1234-abcd-123456789abc"
     assert public_detail_url(LEVER.replace("jobs.lever.co", "jobs.eu.lever.co")).startswith("https://api.eu.lever.co/")
     assert public_detail_url({"apply_url": "https://evil.test/role", "board": "example"}) is None
+
+
+@pytest.mark.parametrize("query", ["content=true", "content=true&pay_transparency=true"])
+def test_greenhouse_public_fetch_and_saved_metadata_allow_only_exact_current_or_legacy_query(query):
+    from jobradar.ingest import _allowed_fetch_url
+    job = fetched()
+    endpoint = "https://boards-api.greenhouse.io/v1/boards/example/jobs/1234567009?" + query
+    assert _allowed_fetch_url(endpoint)
+    job["employer_verified"]["source_url"] = endpoint
+    assert verified_destination(job)
+
+
+@pytest.mark.parametrize("query", ["", "content=false", "pay_transparency=true", "content=true&pay_transparency=false",
+                                 "pay_transparency=true&content=true", "content=true&pay_transparency=true&extra=1",
+                                 "content=true&pay_transparency=true&content=false", "content=true&pay_transparency=true&",
+                                 "content=true&pay%5Ftransparency=true", "content=true&pay_transparency=TRUE"])
+def test_greenhouse_public_fetch_and_saved_metadata_reject_unapproved_query_variants(query):
+    from jobradar.ingest import _allowed_fetch_url
+    endpoint = "https://boards-api.greenhouse.io/v1/boards/example/jobs/1234567009?" + query
+    assert not _allowed_fetch_url(endpoint)
+    job = fetched()
+    job["employer_verified"]["source_url"] = endpoint
+    assert not verified_destination(job)
+
+
+@pytest.mark.parametrize("change", [lambda url: url.replace("boards-api.greenhouse.io", "boards-api.greenhouse.io.evil.test"),
+                                    lambda url: url.replace("example/jobs", "other/jobs"),
+                                    lambda url: url.replace("1234567009", "1234567010"),
+                                    lambda url: url.replace("https:", "http:"),
+                                    lambda url: url + "#private"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_optional_public_pay_query_does_not_widen_bound_posting_or_origin(change, legacy):
+    job = fetched()
+    endpoint = public_detail_url(GREENHOUSE)
+    if legacy:
+        endpoint = endpoint.removesuffix("&pay_transparency=true")
+    job["employer_verified"]["source_url"] = change(endpoint)
+    assert not verified_destination(job)
 
 
 @pytest.mark.parametrize("url", [LEVER, GREENHOUSE])

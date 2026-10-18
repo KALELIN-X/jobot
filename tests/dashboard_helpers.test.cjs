@@ -12,7 +12,7 @@ function dashboardHelpers(rules = {}) {
   const context = {state: {rules}};
   vm.createContext(context);
   // Execute the production pure functions without a DOM, network, or app state.
-  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {experienceMatches, experienceVisible, experienceLabel, newGradPriority, compareJobs};", context);
+  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {experienceLimit, experienceMatches, experienceVisible, experienceLabel, newGradPriority, compareJobs};", context);
   return context.helpers;
 }
 
@@ -189,4 +189,74 @@ test("saving exact location and employer lists does not split names containing c
   const {exactLines} = queueHelpers();
   assert.deepEqual(Array.from(exactLines("San Francisco, CA\nChicago\r\nSan Francisco, CA")), ["San Francisco, CA","Chicago"]);
   assert.deepEqual(Array.from(exactLines("Widgets, Inc.\nAnother Company")), ["Widgets, Inc.","Another Company"]);
+});
+
+function postingHelpers() {
+  const source = fs.readFileSync(path.join(__dirname, "..", "static", "app.js"), "utf8");
+  const start = source.indexOf("  function queueCardAction(");
+  const end = source.indexOf("  function jobCard(", start);
+  const context = {
+    isDemo: posting => posting.demo === true,
+    experienceLabel: dashboardHelpers().experienceLabel,
+    escape: value => String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char])),
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,end) + "\nthis.helpers={queueCardAction,jobFactsMarkup};",context);
+  return context.helpers;
+}
+
+test("manual queue controls rely on availability instead of a fit or eligibility gate", () => {
+  const {queueCardAction} = postingHelpers();
+  const held = {score:10,status:"needs_attention",submission_check:{eligible:false},queue_actions:{can_add:true}};
+  assert.equal(queueCardAction(held).kind,"add");
+  assert.equal(queueCardAction({...held,status:"queued",queue_actions:{can_remove:true}}).kind,"remove");
+  const prior = queueCardAction({...held,status:"submitted",queue_actions:{can_add:false,reason:"Already recorded as applied."}});
+  assert.equal(prior.kind,"unavailable");
+  assert.equal(prior.reason,"Already recorded as applied.");
+  assert.match(queueCardAction({demo:true}).reason,/demo/);
+});
+
+test("compact posting facts preserve stated pay units, expose missing facts, and escape source text", () => {
+  const {jobFactsMarkup} = postingHelpers();
+  const result = jobFactsMarkup({location:"Boston, MA",facts:{
+    pay:{summary:"USD $45–$55 / hour",status:"stated"},
+    degree:{summary:'Bachelor’s or equivalent <script>alert("x")</script>',status:"stated"},
+    graduation:{summary:"2025–2026",status:"stated"},
+  }});
+  assert.match(result,/USD \$45–\$55 \/ hour/);
+  assert.match(result,/Graduation window/);
+  assert.match(result,/2025–2026/);
+  assert.match(result,/Boston, MA/);
+  assert.match(result,/Experience/);
+  assert.match(result,/unknown/);
+  assert.doesNotMatch(result,/<script>/);
+  assert.match(result,/&lt;script&gt;/);
+  assert.match(jobFactsMarkup({}),/Not listed/);
+});
+
+test("queued jobs stay visible when the optional experience view filter is enabled", () => {
+  const source = fs.readFileSync(path.join(__dirname,"..","static","app.js"),"utf8");
+  const start = source.indexOf("  function renderJobs(");
+  const end = source.indexOf("  function queueCardAction(",start);
+  const elements = new Map();
+  const context = {
+    state:{rules:{max_required_experience_months:12},jobs:[
+      {id:"selected-unknown",status:"queued",score_detail:{}},
+      {id:"discovered-unknown",status:"new",score_detail:{}},
+      {id:"discovered-fit",status:"new",score_detail:{experience_requirement:{minimum_months:0}}},
+    ]},
+    lastJobSignature:"",filter:"queued",search:"",experienceFilterEnabled:true,
+    $: selector => {if (!elements.has(selector)) elements.set(selector,{setAttribute(){}});return elements.get(selector);},
+    list: value => Array.isArray(value) ? value : [],
+    formatNumber: String,
+    ...dashboardHelpers({max_required_experience_months:12}),
+    jobCard: posting => `<article>${posting.id}</article>`,
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,end)+"\nrenderJobs();",context);
+  assert.equal(elements.get("#job-list").innerHTML,"<article>selected-unknown</article>");
+  context.filter="all";
+  context.experienceFilterEnabled=false;
+  vm.runInContext("renderJobs(true);",context);
+  assert.match(elements.get("#job-list").innerHTML,/discovered-unknown/);
 });

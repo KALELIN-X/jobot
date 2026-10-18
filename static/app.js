@@ -13,7 +13,7 @@
   let loaded = false;
   let filter = "all";
   let search = "";
-  let experienceFilterEnabled = true;
+  let experienceFilterEnabled = false;
   let pollTimer;
   let refreshing = false;
   let refreshInFlight = null;
@@ -208,12 +208,12 @@
       if (filter === "queued" && status !== "queued") return false;
       if (filter === "attention" && !jobAttention(job)) return false;
       if (filter === "submitted" && status !== "submitted") return false;
-      if (maximum !== null && experienceFilterEnabled && !experienceVisible(job,maximum)) return false;
+      if (maximum !== null && experienceFilterEnabled && status !== "queued" && !experienceVisible(job,maximum)) return false;
       return !search || `${job.company} ${job.title} ${job.location}`.toLowerCase().includes(search);
     }).sort(compareJobs);
     $("#job-count").textContent = jobs.length === allJobs.length ? formatNumber(allJobs.length) : `${formatNumber(jobs.length)} / ${formatNumber(allJobs.length)}`;
     $("#job-count").setAttribute("aria-label",`${jobs.length} of ${allJobs.length} roles shown`);
-    $("#experience-filter-detail").textContent = maximum === null ? "" : `${jobs.length} of ${allJobs.length} roles shown · ${maximum === 0 ? "No experience required" : `${maximum/12} year${maximum === 12 ? "" : "s"} maximum required`}${experienceFilterEnabled ? state.rules?.prefer_new_grad ? ". New grads with unknown experience are kept for review; other unknowns are hidden. Turn off to review all." : ". Unknown requirements are hidden; turn off to review all." : ". Experience view filter is off."}`;
+    $("#experience-filter-detail").textContent = maximum === null ? "" : `${jobs.length} of ${allJobs.length} roles shown · ${maximum === 0 ? "No experience required" : `${maximum/12} year${maximum === 12 ? "" : "s"} maximum required`}${experienceFilterEnabled ? ". Selected queued jobs stay visible. Turn off to see all experience levels." : ". Showing all experience levels; your saved application rules still apply."}`;
     if (!allJobs.length) {
       $("#job-list").innerHTML = `<div class="empty-state"><div class="empty-radar"><span></span><i></i></div><div class="empty-eyebrow">A LITTLE SETUP. A LOT OF POSSIBILITY.</div><h3>Your next opportunity starts here</h3><p>Add your resume and choose where you want to apply.<br>We’ll help you turn a promising role into a thoughtful application.</p><button class="button button-primary" type="button" data-view="profile">Set up your profile${icon("arrow")}</button><div class="demo-link-row"><button class="text-button" type="button" data-action="demo">Try a local demo <span>↗</span></button><small>Demo uses a local mock employer.</small></div></div>`;
       return;
@@ -223,6 +223,26 @@
       return;
     }
     $("#job-list").innerHTML = jobs.map(jobCard).join("");
+  }
+  function queueCardAction(job) {
+    if (job.queue_actions?.can_add === true) return {kind:"add",label:"Add to queue",reason:""};
+    if (job.queue_actions?.can_remove === true) return {kind:"remove",label:"Remove from queue",reason:""};
+    return {kind:"unavailable",label:"Add to queue",reason:job.queue_actions?.reason || (isDemo(job) ? "Local demo records stay separate from your application queue." : job.status === "queued" ? "This role is already in your queue." : "This application cannot be queued again. Review its recorded outcome.")};
+  }
+  function jobFactsMarkup(job) {
+    const facts = job.facts || {};
+    const entries = [
+      ["location","Location",job.location || "Not listed"],
+      ["experience","Experience",experienceLabel(job.score_detail?.experience_requirement,job.score_detail?.is_new_grad === true).replace(/^Experience: /,"")],
+      ["pay","Pay","Not listed"],
+      ["degree","Education","Not listed"],
+      ["graduation","Graduation window","Not listed"]
+    ];
+    return `<dl class="job-facts">${entries.map(([key,label,fallback]) => {
+      const fact = facts[key] || {};
+      const summary = typeof fact.summary === "string" && fact.summary.trim() ? fact.summary : fallback;
+      return `<div class="job-fact ${key === "location" ? "fact-location" : ""}"><dt>${escape(label)}</dt><dd class="${fact.status === "not_stated" || summary === "Not listed" ? "not-listed" : ""}">${escape(summary)}</dd></div>`;
+    }).join("")}</dl>`;
   }
   function jobCard(job) {
     const id = String(job.id);
@@ -245,15 +265,23 @@
     const canRecordApplied = !hideJobActions && !isSubmitted;
     const priorApplicationHelp = canRecordApplied && !supportedPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact supported posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
     const checks = list(job.submission_check?.blockers);
-    const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-memory">Answer new application questions →</button>' : ""}` : "";
+    const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-questions" data-id="' + escape(id) + '">Answer new application questions →</button>' : ""}` : "";
     const pendingCount = list(state.answer_memory?.pending).filter(item => item.job_id === job.id).length;
-    const canAdd = job.queue_actions?.can_add === true;
-    const canRemove = job.queue_actions?.can_remove === true;
-    const quickActions = `<div class="job-quick-actions">${canAdd ? `<button type="button" class="button button-primary" data-action="queue" data-id="${escape(id)}">Add to queue ${icon("arrow")}</button>` : ""}${canRemove ? `<button type="button" class="button button-secondary" data-action="unqueue" data-id="${escape(id)}">Remove from queue</button>` : ""}${pendingCount ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(id)}">Review ${pendingCount} question${pendingCount === 1 ? "" : "s"}</button>` : ""}</div>`;
+    const queueAction = queueCardAction(job);
+    const selectionButton = queueAction.kind === "unavailable" ? `<button type="button" class="button button-secondary" disabled title="${escape(queueAction.reason)}">${queueAction.label}</button><span class="queue-action-reason">${escape(queueAction.reason)}</span>` : `<button type="button" class="button ${queueAction.kind === "add" ? "button-primary" : "button-secondary"}" data-action="${queueAction.kind === "add" ? "queue" : "unqueue"}" data-id="${escape(id)}">${queueAction.label}${queueAction.kind === "add" ? icon("arrow") : ""}</button>`;
+    const quickActions = `<div class="job-quick-actions">${selectionButton}${pendingCount ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(id)}">Review ${pendingCount} question${pendingCount === 1 ? "" : "s"}</button>` : ""}</div>`;
     const active = state.run?.active_job?.id === job.id && ["running","stopping"].includes(state.run?.status);
     const observed = active ? `<div class="card-worker-stage">${icon("activity")} ${escape(state.run.message)} · ${escape(fullDate(state.run.updated_at))}</div>` : "";
     const submissionInfo = isSubmitted ? [...new Set([job.message,job.confirmation,job.error].filter(Boolean).map(value => typeof value === "object" ? JSON.stringify(value) : String(value)))].join(" ") : "";
-    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.matches_rules === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div>${quickActions}${observed}<div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+    const sourceEvidence = Object.values(job.facts || {}).flatMap(fact => list(fact.evidence));
+    return `<article class="job-card" data-job-id="${escape(id)}">
+      <div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta">${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div>
+      ${!isDemo(job) ? jobFactsMarkup(job) : ""}
+      <div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.matches_rules === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "Checks & details"}${icon("chevron")}</button></div>
+      ${quickActions}${observed}
+      <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}
+        <details class="fit-explanation"><summary>Score evidence & eligibility</summary><div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${sourceEvidence.length ? `<div class="detail-label">Job fact source excerpts</div>${evidence([...new Set(sourceEvidence)])}` : ""}</details>
+        ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
@@ -320,7 +348,7 @@
   function openQueueReview() {
     if (!dirty.profile && !dirty.rules && !list(state.setup_problems).length && state.approval?.approved && !state.queue?.queued) {
       setView("queue");
-      showNotice("Your selected queue is empty. Use Add to queue on a role, or Queue matching roles.");
+      showNotice("Your selected queue is empty. Add a role individually, or choose Load jobs to queue for jobs that meet your score cutoff.");
       return;
     }
     const target = dirty.profile ? {view:"profile",selector:'#profile-form button[type="submit"]'} : dirty.rules ? {view:"rules",selector:'#rules-form button[type="submit"]'} : setupDestination(state);
@@ -341,7 +369,7 @@
     const visibleProblems = dirty.profile || dirty.rules ? ["Save your profile or rule changes before approving.",...problems] : problems;
     $("#queue-blockers").innerHTML = visibleProblems.map(problem => `<li>${escape(problem)}</li>`).join("");
     $("#queue-blockers").hidden = !visibleProblems.length || control.running;
-    $("#queue-health").textContent = loaded ? `${queue.queued ?? 0} selected · ${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.matching ?? 0} matching discoveries · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
+    $("#queue-health").textContent = loaded ? `${queue.queued ?? 0} selected · ${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.loadable ?? 0} available above score cutoff · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
     $("#queue-review-button").textContent = setup.length ? "Complete setup →" : control.approved ? "Review rules →" : "Review & approve →";
     $("#queue-review-button").disabled = control.running;
   }
@@ -420,8 +448,9 @@
     $("#profile-status").classList.toggle("ready",approved);
     $("#automation-status").innerHTML = `<span class="status-dot"></span>${running ? "Run in progress" : enabled ? "Automation on" : "Automation off"}`;
     $("#automation-status").classList.toggle("enabled",enabled || running);
-    $("#queue-matching-button").disabled = running || !state.queue?.matching || busyActions.has("queue-matching");
-    $("#queue-matching-button").textContent = `Queue matching roles (${state.queue?.matching ?? 0})`;
+    $("#queue-matching-button").disabled = !loaded || running || !state.queue?.loadable || busyActions.has("queue-matching") || dirty.rules;
+    $("#queue-matching-button").textContent = `Load jobs to queue (${state.queue?.loadable ?? 0})`;
+    $("#bulk-queue-help").textContent = dirty.rules ? "Save your rule changes to use the updated score cutoff." : `Adds all available jobs with a fit score of ${state.rules?.min_score ?? 60}+ across the fetched list. Jobs below the cutoff can be added individually. Submission checks still apply.`;
     const control = queueControlState(state,dirty.profile || dirty.rules);
     $("#run-button").disabled = !loaded || running || busyActions.has("run");
     $("#run-button").title = control.canRun ? "Run eligible applications once; scheduling stays separate" : "Review your setup and the visible queue blockers";
@@ -678,7 +707,7 @@
     if (name === "review-queue") {
       openQueueReview();
     } else if (name === "queue-matching") {
-      action("queue-matching",button,async () => { const result = await post("/api/queue/matching"); filter = "queued"; updateFilters(); return result; },result => result.message);
+      action("queue-matching",button,async () => { const result = await post("/api/queue/matching"); filter = "queued"; search = ""; $("#job-search").value = ""; updateFilters(); return result; },result => result.message);
     } else if (name === "stop-run") {
       action("stop-run",button,() => post("/api/run/stop"),"Stop requested before the next submission. Scheduling is off; an already sent application cannot be undone.");
     } else if (name === "refresh-worker") {
@@ -706,7 +735,7 @@
       const detail = document.getElementById(button.getAttribute("aria-controls"));
       const open = expanded.has(id);
       button.setAttribute("aria-expanded",String(open));
-      button.innerHTML = `${open ? "Less detail" : "View details"}${icon("chevron")}`;
+      button.innerHTML = `${open ? "Less detail" : "Checks & details"}${icon("chevron")}`;
       if (detail) detail.hidden = !open;
     } else if (name === "queue" || name === "unqueue" || name === "dismiss") {
       action(`job-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/status`,{status:name === "queue" ? "queued" : name === "unqueue" ? "new" : "dismissed"}),name === "queue" ? "Role added to your selected queue. Nothing is submitted until you run with approved details." : name === "unqueue" ? "Role removed from the queue and returned to discovery." : "Role dismissed.");

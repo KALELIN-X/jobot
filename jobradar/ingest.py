@@ -229,7 +229,7 @@ def _allowed_fetch_url(url: str) -> bool:
             return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", path)) and not parts.query
         return (parts.netloc == "boards-api.greenhouse.io"
                 and bool(re.fullmatch(r"/v1/boards/[A-Za-z0-9][A-Za-z0-9_-]{0,79}/jobs/[1-9][0-9]{0,19}", parts.path))
-                and parts.query == "content=true")
+                and parts.query in {"content=true", "content=true&pay_transparency=true"})
     except (TypeError, ValueError):
         return False
 

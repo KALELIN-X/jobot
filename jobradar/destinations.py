@@ -89,7 +89,8 @@ def public_detail_url(destination) -> str | None:
     if parsed["ats"] == "lever":
         api_host = "api.eu.lever.co" if parsed["host"] == "jobs.eu.lever.co" else "api.lever.co"
         return f"https://{api_host}/v0/postings/{parsed['board']}/{parsed['posting_id']}"
-    return f"https://boards-api.greenhouse.io/v1/boards/{parsed['board']}/jobs/{parsed['posting_id']}?content=true"
+    return (f"https://boards-api.greenhouse.io/v1/boards/{parsed['board']}/jobs/{parsed['posting_id']}"
+            "?content=true&pay_transparency=true")
 
 
 def listing_binding(job: dict) -> str | None:
@@ -157,5 +158,12 @@ def verified_destination(job: dict) -> bool:
     evidence = job.get("employer_verified")
     if not isinstance(evidence, dict):
         return False
-    return evidence == {"source_url": public_detail_url(parsed),
-                        "application_key": parsed["application_key"], "posting_id": parsed["posting_id"]}
+    endpoint = public_detail_url(parsed)
+    endpoints = {endpoint}
+    if parsed["ats"] == "greenhouse":
+        # The earlier single-posting GET proves the same posting identity.
+        # Preserve that saved proof; the next official refresh requests the
+        # optional public pay ranges along with its already required content.
+        endpoints.add(endpoint.removesuffix("&pay_transparency=true"))
+    return any(evidence == {"source_url": source_url, "application_key": parsed["application_key"],
+                            "posting_id": parsed["posting_id"]} for source_url in endpoints)

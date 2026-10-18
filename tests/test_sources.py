@@ -134,6 +134,38 @@ def test_official_timezone_annotations_cannot_keep_a_stale_us_country_stamp(loca
     assert not sources.us_location(result["location"])
 
 
+def test_official_lever_preserves_bounded_optional_pay_and_explicit_work_model():
+    from jobradar.job_facts import job_facts
+    result = sources.employer_metadata(posting(LEVER), employer_payload(LEVER,
+        salaryRange={"currency": "USD", "interval": "per-hour", "min": 40.5, "max": 50.75},
+        salaryDescriptionPlain="Hourly base pay, with equity considered separately. " * 200,
+        workplaceType="hybrid"))
+    assert result["published_pay"][0]["period"] == "hour"
+    assert result["published_pay"][0]["minimum"] == 40.5
+    assert len(result["pay_description"]) == 4000
+    assert result["work_model"] == "hybrid"
+    assert result["description"] == DESCRIPTION.strip()
+    assert job_facts(result)["pay"]["status"] == "stated"
+
+
+def test_official_greenhouse_preserves_returned_pay_cents_without_inventing_period():
+    from jobradar.job_facts import job_facts
+    result = sources.employer_metadata(posting(), employer_payload(pay_input_ranges=[
+        {"min_cents": 10000000, "max_cents": 12000000, "currency_type": "USD", "title": "Boston salary range"}]))
+    assert result["published_pay"][0]["minimum"] == 100000
+    assert result["published_pay"][0]["period"] is None
+    assert job_facts(result)["pay"]["status"] == "unclear"
+
+
+@pytest.mark.parametrize("url", [GREENHOUSE, LEVER])
+def test_removed_official_pay_cannot_reuse_saved_pay_metadata(url):
+    job = posting(url)
+    job.update(published_pay=[{"minimum": 100000, "maximum": 120000, "currency": "USD", "period": "year"}], pay_description="Old salary range")
+    result = sources.employer_metadata(job, employer_payload(url))
+    assert result["published_pay"] == [] and result["pay_description"] == ""
+    assert job["published_pay"] and job["pay_description"] == "Old salary range"
+
+
 def test_successful_and_failed_employer_descriptions_are_independent(monkeypatch):
     requested = []
     def handler(request):

@@ -129,12 +129,17 @@ def test_one_ready_role_does_not_allow_worker_to_open_another_known_question_hol
     assert client.app.state.store.job("questions")["attempted_at"] is None
 
 
-def test_bulk_selection_leaves_known_required_questions_unselected(client):
+def test_score_loading_can_queue_question_holds_without_making_them_submission_ready(client):
     configure_and_approve(client)
     add_job(client, "questions")
     client.app.state.store.update_job("questions", "new", pending_questions=[question()])
     state = client.get("/api/state").json()
     assert state["queue"]["discovered"] == 1
     assert state["queue"]["matching"] == 0
-    assert client.post("/api/queue/matching", headers=HEADERS).json()["added"] == 0
-    assert client.app.state.store.job("questions")["status"] == "new"
+    assert state["queue"]["loadable"] == 1
+    result = client.post("/api/queue/matching", headers=HEADERS).json()
+    assert result["added"] == result["queued"] == result["blocked"] == 1
+    assert result["ready"] == 0
+    assert client.app.state.store.job("questions")["status"] == "queued"
+    assert client.post("/api/run", headers=HEADERS).status_code == 409
+    assert client.app.state.store.job("questions")["attempted_at"] is None

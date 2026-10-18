@@ -79,7 +79,7 @@ def test_approved_but_empty_queue_returns_actionable_error_instead_of_started(cl
     configure(client)
     response = client.post("/api/run", headers=HEADERS)
     assert response.status_code == 409
-    assert "Queue all matching" in response.json()["detail"]
+    assert "Load jobs to queue" in response.json()["detail"]
     assert not client.get("/api/state").json()["automation"]["running"]
 
 

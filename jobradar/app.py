@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import math
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -19,7 +20,8 @@ from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .destinations import SUPPORTED_HOSTS, verified_destination
 from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules, company_scope
-from .store import Store, now
+from .job_facts import job_facts
+from .store import Store, application_key, now
 from .run_status import RunTracker
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -81,16 +83,55 @@ def create_app(data_dir: Path | None = None):
             problems.append(f"{conflicting} saved answer(s) do not match this form's recorded choices or input type. Review them in Activity.")
         return problems
 
-    def queue_actions(job):
-        active_or_attempted = job["status"] in {"filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or bool(job.get("attempted_at"))
+    def selected_destinations(jobs):
+        selected = {}
+        for job in jobs:
+            if not job.get("demo") and (job["status"] in {"queued", "active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"}
+                                        or job.get("attempted_at")):
+                key = application_key(job)
+                if key:
+                    selected.setdefault(key, set()).add(job["id"])
+        return selected
+
+    def queue_actions(job, selected=None):
+        selected = selected if selected is not None else selected_destinations(store.jobs())
+        active_or_attempted = job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or bool(job.get("attempted_at"))
         prior_destination = store.destination_attempted(job)
-        can_add = (not job.get("demo") and not active_or_attempted and not prior_destination
-                   and job["status"] in {"new", "dismissed", "needs_attention", "failed"})
+        duplicate_selected = bool(selected.get(application_key(job), set()) - {job["id"]})
+        can_add = (not job.get("demo") and not active_or_attempted and not prior_destination and not duplicate_selected
+                   and job["status"] != "queued")
         can_remove = not job.get("demo") and not active_or_attempted and job["status"] == "queued"
         reason = ("Synthetic demo records are separate from the application queue." if job.get("demo") else
                   "An active or attempted application cannot be queued again. Verify its recorded outcome first." if active_or_attempted else
-                  "This employer posting or matching application is already recorded as applied; it cannot be queued again." if prior_destination else "")
+                  "This employer posting or matching application is already recorded as applied; it cannot be queued again." if prior_destination else
+                  "Already in your application queue." if job["status"] == "queued" else
+                  "Another record for this employer posting is already queued or active. Use the existing queue entry." if duplicate_selected else "")
         return {"can_add": can_add, "can_remove": can_remove, "reason": reason}
+
+    def score_qualified(job, rules):
+        score = job.get("score")
+        return (isinstance(score, (int, float)) and not isinstance(score, bool)
+                and math.isfinite(score) and rules["min_score"] <= score <= 100)
+
+    def loadable_jobs(jobs, rules, *, scheduled=False, profile=None):
+        selected = selected_destinations(jobs)
+        candidates = []
+        for job in jobs:
+            if not queue_actions(job, selected)["can_add"] or not score_qualified(job, rules):
+                continue
+            if scheduled and (job["status"] != "new" or matching_problems(job, rules, profile)):
+                continue
+            candidates.append(job)
+        available = []
+        reserved = set(selected)
+        for job in ordered_queue(candidates, rules):
+            key = application_key(job)
+            if key and key in reserved:
+                continue
+            available.append(job)
+            if key:
+                reserved.add(key)
+        return available
 
     def submission_check(job, rules, profile=None):
         problems = matching_problems(job, rules, profile)
@@ -103,26 +144,36 @@ def create_app(data_dir: Path | None = None):
 
     def add_matching_jobs(*, scheduled=False):
         profile, rules, resume, approval = configuration()
-        if scheduled and (not store.get("automation", {}).get("enabled") or not valid_approval(profile, rules, resume, approval)
-                          or configuration_problems(profile, rules, resume)):
-            return {"added": 0, "queued": sum(job["status"] == "queued" and not job.get("demo") for job in store.jobs()), "remaining_matching": 0}
+        scheduling_allowed = (not scheduled or (store.get("automation", {}).get("enabled")
+                              and valid_approval(profile, rules, resume, approval)
+                              and not configuration_problems(profile, rules, resume)))
+        # Manual loading is a shortlist action. Scheduling still needs fresh
+        # discoveries that pass every approved submission rule.
+        candidates = loadable_jobs(store.jobs(), rules, scheduled=scheduled, profile=profile) if scheduling_allowed else []
         added = 0
-        for job in ordered_queue(store.jobs(), rules):
-            if job["status"] != "new" or not queue_actions(job)["can_add"] or matching_problems(job, rules, profile):
-                continue
+        for job in ordered_queue(candidates, rules):
             store.update_job(job["id"], "queued", error=None)
             added += 1
         jobs = store.jobs()
-        result = {"added": added, "queued": sum(job["status"] == "queued" and not job.get("demo") for job in jobs),
-                  "remaining_matching": sum(job["status"] == "new" and queue_actions(job)["can_add"] and not matching_problems(job, rules, profile) for job in jobs)}
+        selected = selected_destinations(jobs)
+        queued = [job for job in jobs if job["status"] == "queued" and not job.get("demo")]
+        ready = sum(not matching_problems(job, rules, profile) for job in queued)
+        result = {"added": added, "queued": len(queued), "ready": ready, "blocked": len(queued) - ready,
+                  "min_score": rules["min_score"],
+                  "remaining_loadable": len(loadable_jobs(jobs, rules)),
+                  "remaining_matching": sum(job["status"] == "new" and queue_actions(job, selected)["can_add"] and score_qualified(job, rules)
+                                            and not matching_problems(job, rules, profile) for job in jobs)}
         if added:
-            store.event("queue", f"{'Scheduled automation selected' if scheduled else 'Added'} {added} matching role(s) for the application queue.")
+            message = (f"Scheduled automation selected {added} eligible discovered role(s) for the application queue." if scheduled else
+                       f"Loaded {added} role(s) scoring at least {rules['min_score']}/100 into the application queue. Submission checks still apply.")
+            store.event("queue", message)
         return result
 
     def queue_readiness(jobs, profile, rules, resume, approval):
         real_jobs = [job for job in jobs if not job.get("demo")]
         discovered = [job for job in real_jobs if job["status"] == "new"]
         matching = sum(job["submission_check"]["matches_rules"] and job["queue_actions"]["can_add"] for job in discovered)
+        loadable = len(loadable_jobs(real_jobs, rules))
         pending = [job for job in real_jobs if job["status"] == "queued"]
         ready = sum(job["submission_check"]["eligible"] for job in pending)
         day = datetime.now(timezone.utc).date().isoformat()
@@ -134,10 +185,10 @@ def create_app(data_dir: Path | None = None):
         if not remaining:
             problems.append("Daily submission-attempt limit reached (UTC day). Your remaining queue is saved.")
         if not pending:
-            problems.append("Your application queue is empty. Add a role to the queue or choose Queue all matching before running.")
+            problems.append("Your application queue is empty. Add a role to the queue or choose Load jobs to queue before running.")
         elif not ready:
             problems.append("No queued roles currently pass your saved rules. Check each role's submission blockers before running.")
-        return {"discovered": len(discovered), "matching": matching, "discovery_blocked": len(discovered) - matching,
+        return {"discovered": len(discovered), "matching": matching, "loadable": loadable, "discovery_blocked": len(discovered) - matching,
                 "queued": len(pending), "pending": len(pending), "ready": ready, "blocked": len(pending) - ready,
                 "attempts_today": attempts, "remaining_today": remaining,
                 "can_run": not problems and not worker_busy(), "blockers": problems}
@@ -398,14 +449,20 @@ def create_app(data_dir: Path | None = None):
         profile, rules, resume, approval = configuration()
         run_snapshot = tracker.snapshot()
         jobs = store.jobs()
+        selected = selected_destinations(jobs)
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
             job["submission_check"] = submission_check(job, rules, profile)
-            job["queue_actions"] = queue_actions(job)
+            job["queue_actions"] = queue_actions(job, selected)
             job["unanswered_question_count"], job["conflicting_answer_count"] = unanswered_question_counts(job, profile)
         for job in jobs:
             job["browser_capture_available"] = capture_path(job) is not None
             job.pop("screenshot", None)
+            job["facts"] = job_facts(job)
+            # Preserve source text in SQLite for ranking and the pre-submit
+            # refresh, without resending full postings on every status poll.
+            for field in ("description", "requirements", "required_skills", "preferred_skills", "published_pay", "pay_description"):
+                job.pop(field, None)
         return {
             "profile": profile, "rules": rules,
             "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")},
@@ -536,8 +593,10 @@ def create_app(data_dir: Path | None = None):
     @app.post("/api/queue/matching")
     async def queue_matching_endpoint():
         result = add_matching_jobs()
-        message = (f"Added {result['added']} matching role(s) to your application queue."
-                   if result["added"] else "No additional discovered roles currently pass your saved rules.")
+        message = (f"Loaded {result['added']} role(s) scoring at least {result['min_score']}/100 into your application queue. "
+                   f"{result['ready']} ready; {result['blocked']} need review. Submission checks still apply."
+                   if result["added"] else f"No additional available roles meet your {result['min_score']}/100 score threshold. "
+                   "Already queued, active, attempted and duplicate applications are excluded.")
         return {**result, "message": message}
 
     @app.post("/api/automation")
@@ -568,7 +627,7 @@ def create_app(data_dir: Path | None = None):
         job = store.job(job_id)
         if not job:
             raise HTTPException(404, "Job not found.")
-        if job["status"] in {"filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or job.get("attempted_at"):
+        if job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or job.get("attempted_at"):
             raise HTTPException(409, "An active or attempted application cannot be requeued automatically. Verify its outcome first.")
         actions = queue_actions(job)
         already_selected = job["status"] == "queued" and not job.get("demo")
@@ -576,8 +635,10 @@ def create_app(data_dir: Path | None = None):
             raise HTTPException(409, actions["reason"] or "This record cannot be added to the application queue.")
         if status == "new" and not actions["can_remove"]:
             raise HTTPException(409, "Only a selected queued role can be removed from the queue.")
+        if status == "queued" and already_selected:
+            return {"ok": True, "status": status, "already_queued": True, "message": actions["reason"]}
         store.update_job(job_id, status, error=None)
-        return {"ok": True, "status": status}
+        return {"ok": True, "status": status, "already_queued": False}
 
     @app.post("/api/applied-elsewhere")
     async def applied_elsewhere(body: ExternalApplicationRequest):

@@ -25,7 +25,7 @@ def _marker(status, message):
 def _clean_cached_evidence(job):
     result = copy.deepcopy(job)
     result.update(description="", description_source=None, requirements=[], required_skills=[], preferred_skills=[],
-                  employer_verified=None, destination_provenance=None, closed=None, score=None, score_detail={})
+                  published_pay=[], pay_description="", employer_verified=None, destination_provenance=None, closed=None, score=None, score_detail={})
     return result
 
 
