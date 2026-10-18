@@ -1,4 +1,4 @@
-"""Conservative, single-attempt application automation for approved Lever jobs.
+"""Conservative, single-attempt browser automation for approved ATS forms.
 
 The planner is deliberately independent of Playwright.  A field is answerable only
 from an explicit profile value or an exact approved question/answer pair.  The
@@ -11,13 +11,16 @@ import hashlib
 import json
 import re
 import uuid
+import calendar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import unquote, urlsplit
 
+from .destinations import GREENHOUSE_HOSTS, LEVER_HOSTS, parse_destination
+from .form_adapters import GreenhouseTransport, SNAPSHOT_JS, choose_combobox, enrich_comboboxes
 
-LEVER_HOSTS = frozenset({"jobs.lever.co", "jobs.eu.lever.co"})
+
 _APPLY_PATH = re.compile(
     r"^/[A-Za-z0-9][A-Za-z0-9_-]*/"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -88,13 +91,12 @@ def validate_application_url(
             or parts.path.rstrip("/") != "/mock/apply"
         ):
             raise URLNotApproved("Only the local mock application is supported in fixture mode.")
-    elif (
-        parts.scheme != "https"
-        or host not in LEVER_HOSTS
-        or port not in (None, 443)
-        or not _APPLY_PATH.fullmatch(parts.path)
-    ):
-        raise URLNotApproved("Only approved HTTPS Lever application URLs are supported.")
+    else:
+        destination = parse_destination(url)
+        if destination is None or destination["ats"] not in {"lever", "greenhouse"}:
+            raise URLNotApproved("Only approved HTTPS Lever or Greenhouse application URLs are supported.")
+        if destination["ats"] == "lever" and not _APPLY_PATH.fullmatch(parts.path):
+            raise URLNotApproved("A Lever application must use its exact apply URL.")
     return host
 
 
@@ -104,6 +106,7 @@ def validate_destination_url(
     allowed_hosts: set[str],
     *,
     fixture: bool = False,
+    document: bool = False,
 ) -> None:
     """Require the original approved origin for every document destination."""
     original_host = validate_application_url(initial_url, allowed_hosts, fixture=fixture)
@@ -118,6 +121,14 @@ def validate_destination_url(
         raise URLNotApproved("The application navigated outside its approved origin.")
     if fixture and parts.path.rstrip("/") not in {"/mock/apply", "/mock/thanks"}:
         raise URLNotApproved("The mock application navigated outside its approved paths.")
+    if not fixture and original_host in GREENHOUSE_HOSTS:
+        destination = parse_destination(initial_url)
+        # Remain on this exact board/posting, including its own confirmation.
+        # Same-origin API requests are checked separately by the request guard.
+        if destination and (document or re.search(r"/jobs/\d+", parts.path)):
+            allowed_path = urlsplit(destination["canonical_url"]).path.rstrip("/")
+            if parts.path.rstrip("/").casefold() not in {allowed_path, allowed_path + "/confirmation"}:
+                raise URLNotApproved("The application navigated to a different Greenhouse posting.")
 
 
 def _label(value: Any) -> str:
@@ -128,6 +139,16 @@ def _label(value: Any) -> str:
 
 def _normal(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _us_or_unspecified_authorization(question: str) -> bool:
+    if question in {"work authorization", "work authorized"}:
+        return True
+    match = re.search(r"\bauthorized to work\b", question)
+    if not match:
+        return False
+    suffix = question[match.end():].strip()
+    return not suffix or bool(re.fullmatch(r"(?:for any employer )?in (?:the )?(?:united states(?: of america)?|us|u s|usa|u s a)", suffix))
 
 
 @dataclass(frozen=True)
@@ -170,7 +191,7 @@ def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[
         plan.pending_questions.append({
             "id": hashlib.sha256(question.encode("utf-8")).hexdigest()[:20],
             "key": question, "question": question, "type": kind,
-            "required": bool(item.get("required")), "options": choices[:100], "reason": reason,
+            "required": bool(item.get("required")), "options": choices[:300], "reason": reason,
         })
 
 
@@ -180,6 +201,24 @@ def _answer(item: dict, profile: dict) -> Any:
     answers = profile.get("answers") or {}
     if isinstance(answers, dict) and label in answers:
         return answers[label]
+    # A supplied graduation month can answer month/year fields, but never
+    # manufacture a day for a full-date field.
+    graduation = profile.get("graduation_month")
+    question = _normal(label)
+    if isinstance(graduation, str) and re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", graduation):
+        year, month = graduation.split("-")
+        if question in {"graduation month", "expected graduation month"}:
+            if item.get("type") == "month":
+                return graduation
+            if item.get("type") == "number":
+                return str(int(month))
+            choices = {month, str(int(month)), calendar.month_name[int(month)], calendar.month_abbr[int(month)]}
+            available = [option for option in item.get("options", []) if option.get("label") in choices or str(option.get("value")) in choices]
+            return available[0]["label"] if len(available) == 1 else calendar.month_name[int(month)]
+        if question in {"graduation year", "expected graduation year"}:
+            return year
+        if item.get("type") == "month" and question in {"graduation date", "expected graduation date", "graduation month year"}:
+            return graduation
     name_aliases = {
         "name": {"name", "full name", "fullname", "your name", "legal name", "full legal name"},
         "first_name": {"first name", "firstname", "given name", "givenname", "legal first name", "legal given name"},
@@ -215,7 +254,7 @@ def _answer(item: dict, profile: dict) -> Any:
     if (
         re.search(r"\b(?:legally )?authorized to work\b", question)
         or question in {"work authorization", "work authorized"}
-    ) and type(profile.get("work_authorized")) is bool:
+    ) and type(profile.get("work_authorized")) is bool and _us_or_unspecified_authorization(question):
         return profile["work_authorized"]
     if (
         "sponsorship" in question
@@ -264,6 +303,12 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         if _LEGAL.search(label + " " + name) and (required or kind in {"checkbox", "radio"}):
             plan.blockers.append(f"Human review required for declaration or agreement: {description[:160]}")
             continue
+        if _PRIVATE_CHALLENGE.search(label + " " + name):
+            plan.blockers.append(f"A verification, account, or private-data field requires human review: {description[:160]}")
+            continue
+        if item.get("multiple"):
+            plan.blockers.append(f"A multiple-selection field requires human review: {description[:160]}")
+            continue
         if kind == "radio":
             radios.setdefault(str(item.get("name") or label), []).append(item)
             continue
@@ -295,6 +340,9 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             if option is None or str(option.get("value", "")) == "":
                 _pending_question(plan, item, reason="choice_unavailable")
                 plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
+            elif item.get("combobox"):
+                if _label(item.get("selected_label")) != _label(option["label"]):
+                    plan.actions.append(FieldAction(item["id"], "combobox", str(option["label"])))
             elif str(item.get("value", "")) != str(option["value"]):
                 plan.actions.append(FieldAction(item["id"], "select", str(option["value"])))
         elif kind in {"text", "email", "tel", "url", "number", "date", "month", "search", "textarea"}:
@@ -321,45 +369,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
     return plan
 
 
-_SNAPSHOT_JS = r"""(token) => {
-  const visible = el => !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
-  const text = el => el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '';
-  const controls = Array.from(document.querySelectorAll('input,select,textarea'));
-  const fields = controls.map((el, i) => {
-    el.setAttribute('data-jobradar-field', token + '-' + i);
-    const box = el.closest('.application-question,.form-field,.field,.form-group,fieldset');
-    const associated = Array.from(el.labels || []).map(text).filter(Boolean).join(' ');
-    const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/).map(id => text(document.getElementById(id))).filter(Boolean).join(' ');
-    const question = box && box.querySelector('legend,.application-label,.application-question-label,.field-label');
-    const label = el.type === 'radio' ? (text(question) || labelled || el.getAttribute('aria-label') || associated) :
-      (associated || labelled || el.getAttribute('aria-label') || text(question));
-    return {id: token + '-' + i, name: el.name || '', label: label || '',
-      option_label: associated, type: el.type || el.tagName.toLowerCase(), tag: el.tagName.toLowerCase(),
-      required: !!(el.required || el.getAttribute('aria-required') === 'true' ||
-        /[*✱∗]\s*$|\(required\)\s*$/i.test(label || '') || (box && (box.classList.contains('required') || !!box.querySelector('.required,[aria-required="true"]')))),
-      disabled: el.disabled, visible: visible(el), value: el.value || '', checked: !!el.checked,
-      has_file: !!(el.files && el.files.length),
-      options: el.options ? Array.from(el.options).map(o => ({value: o.value, label: text(o), disabled: o.disabled})) : []};
-  });
-  const forms = Array.from(document.forms).filter(visible).map(f => ({
-    action: f.action || location.href, method: (f.method || 'get').toLowerCase(),
-    fields: controls.filter(c => c.form === f).map(c => c.getAttribute('data-jobradar-field'))
-  }));
-  const candidates = Array.from(document.querySelectorAll('button,input[type=submit]')).filter(el => {
-    if (!visible(el) || el.disabled) return false;
-    const label = text(el) || el.value || '';
-    return /^(?:submit(?: application)?|submit your application|apply|send application)$/i.test(label.trim());
-  });
-  candidates.forEach((el, i) => el.setAttribute('data-jobradar-submit', token + '-' + i));
-  return {fields, forms, buttons: candidates.map((el, i) => ({id: token + '-' + i,
-    action: el.formAction || (el.form && el.form.action) || location.href,
-    form_fields: el.form ? controls.filter(c => c.form === el.form).map(c => c.getAttribute('data-jobradar-field')) : []})),
-    captcha: !!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],iframe[title*="CAPTCHA"],iframe[title*="captcha"],.g-recaptcha,.h-captcha,[data-sitekey]'),
-    login: controls.some(el => el.type === 'password' && visible(el)) ||
-      Array.from(document.querySelectorAll('h1,h2')).some(el => visible(el) && /^(?:log in|login|sign in)(?: to .*)?$/i.test(text(el))),
-    body: document.body ? document.body.innerText : ''};
-}"""
-
+_SNAPSHOT_JS = SNAPSHOT_JS
 
 def _form_blockers(snapshot: dict, initial_url: str, allowed_hosts: set[str], fixture: bool) -> list[str]:
     blockers = []
@@ -377,8 +387,10 @@ def _form_blockers(snapshot: dict, initial_url: str, allowed_hosts: set[str], fi
     else:
         fields = [f for f in snapshot.get("fields", []) if f["id"] in buttons[0].get("form_fields", []) and f.get("visible", True) and not f.get("disabled") and f.get("type") != "hidden"]
         has_name = any(_normal(f.get("label")) in {"name", "full name", "your name"} or _normal(f.get("name")) in {"name", "fullname", "full name"} for f in fields)
+        has_first = any(_normal(f.get("label")) in {"first name", "given name", "legal first name"} or _normal(f.get("name")) in {"first name", "firstname"} for f in fields)
+        has_last = any(_normal(f.get("label")) in {"last name", "family name", "surname", "legal last name"} or _normal(f.get("name")) in {"last name", "lastname"} for f in fields)
         has_email = any(_normal(f.get("label")) in {"email", "email address", "your email"} or _normal(f.get("name")) in {"email", "emailaddress", "email address"} for f in fields)
-        if not has_name or not has_email:
+        if not (has_name or has_first and has_last) or not has_email:
             blockers.append("This is not a recognized application form with name and email fields.")
         try:
             validate_destination_url(buttons[0]["action"], initial_url, allowed_hosts, fixture=fixture)
@@ -408,6 +420,7 @@ async def run_application(
     submit: bool = True,
     fixture: bool = False,
     before_submit: Callable[[], Awaitable[Any]] | None = None,
+    fixture_transport: dict | None = None,
 ) -> dict:
     """Fill an approved form and, when fully cleared, click submit at most once.
 
@@ -424,11 +437,20 @@ async def run_application(
         resume_path = Path(resume_path).resolve()
         if not resume_path.is_file():
             return {"status": "failed", "message": "The supplied resume file is unavailable."}
+    if fixture_transport is not None and not (fixture and job.get("demo") is True):
+        return {"status": "needs_attention", "message": "Local transport fixtures are restricted to synthetic demonstration jobs."}
+    try:
+        transport = GreenhouseTransport(url, resume_path, local_fixture=fixture_transport)
+    except (ValueError, KeyError, OSError):
+        return {"status": "needs_attention", "message": "The hosted form transport could not be safely initialized."}
     clicked = False
     screenshot = None
     page = None
+    loaded_document = False
     pending_questions: list[dict] = []
     blocked_requests: list[str] = []
+    submission_responses: list[int] = []
+    final_request_count = 0
 
     async def result(status: str, message: str, **extra) -> dict:
         nonlocal screenshot
@@ -454,12 +476,35 @@ async def run_application(
                 context = await browser.new_context(accept_downloads=False, service_workers="block")
 
                 async def guard(route):
+                    nonlocal final_request_count
                     request = route.request
+                    if urlsplit(request.url).hostname == "c.spl.greenhouse.io":
+                        # Hosted-board analytics are unnecessary for applying.
+                        # Drop the payload, without treating telemetry as a form.
+                        await route.abort()
+                        return
                     # Document navigations and data-bearing requests must stay on
                     # the approved origin. No cookies or storage are imported.
                     if request.is_navigation_request() or request.method not in {"GET", "HEAD", "OPTIONS"}:
+                        if transport.enabled and request.method not in {"GET", "HEAD", "OPTIONS"}:
+                            if clicked and request.method == "POST" and transport.is_submit_url(request.url) and final_request_count == 0:
+                                final_request_count += 1
+                                await route.continue_()
+                                return
+                            if not request.is_navigation_request():
+                                upload_body = transport.prepare_upload(request.url, request.method, request.headers, request.post_data_buffer)
+                                if upload_body is not None:
+                                    await route.continue_(post_data=upload_body)
+                                    return
+                            blocked_requests.append("unapproved_transport")
+                            await route.abort()
+                            return
+                        if not clicked and (request.method not in {"GET", "HEAD", "OPTIONS"} or loaded_document and request.is_navigation_request()):
+                            blocked_requests.append("premature_submission")
+                            await route.abort()
+                            return
                         try:
-                            validate_destination_url(request.url, url, allowed_hosts, fixture=fixture)
+                            validate_destination_url(request.url, url, allowed_hosts, fixture=fixture, document=request.is_navigation_request())
                         except URLNotApproved:
                             blocked_requests.append("destination")
                             await route.abort()
@@ -468,16 +513,40 @@ async def run_application(
 
                 await context.route("**/*", guard)
                 page = await context.new_page()
+                page.on("response", transport.observe)
+                def observe_response(response):
+                    if clicked and response.request.method not in {"GET", "HEAD", "OPTIONS"}:
+                        if transport.enabled:
+                            if response.request.method == "POST" and transport.is_submit_url(response.url):
+                                submission_responses.append(response.status)
+                            return
+                        try:
+                            validate_destination_url(response.url, url, allowed_hosts, fixture=fixture)
+                        except URLNotApproved:
+                            if not transport.is_submit_url(response.url):
+                                return
+                        submission_responses.append(response.status)
+                page.on("response", observe_response)
                 page.set_default_timeout(8000)
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                validate_destination_url(page.url, url, allowed_hosts, fixture=fixture)
+                loaded_document = True
+                validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                 await page.locator("input,select,textarea").first.wait_for(state="attached", timeout=10000)
 
                 async def snapshot() -> dict:
-                    validate_destination_url(page.url, url, allowed_hosts, fixture=fixture)
+                    validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                     if blocked_requests:
                         raise URLNotApproved("An unapproved destination was blocked.")
-                    return await page.evaluate(_SNAPSHOT_JS, uuid.uuid4().hex)
+                    current = await page.evaluate(_SNAPSHOT_JS, uuid.uuid4().hex)
+                    if transport.upload_success:
+                        for field in current.get("fields", []):
+                            if field.get("type") == "file" and re.search(r"resume|\bcv\b", field.get("label", ""), re.I):
+                                # The exact selected bytes completed the verified
+                                # upload, even if the renderer reset its input.
+                                field["has_file"] = True
+                    if not current.get("captcha") and not current.get("login") and not _DECLARATION.search(current.get("body", "")):
+                        current = await enrich_comboboxes(page, current, lambda item: _answer(item, profile))
+                    return current
 
                 state = await snapshot()
                 for _ in range(3):
@@ -490,7 +559,7 @@ async def run_application(
                     if not plan.actions:
                         break
                     for action in plan.actions:
-                        validate_destination_url(page.url, url, allowed_hosts, fixture=fixture)
+                        validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                         if blocked_requests:
                             raise URLNotApproved("An unapproved destination was blocked.")
                         control = page.locator(f'[data-jobradar-field="{action.field_id}"]')
@@ -498,10 +567,21 @@ async def run_application(
                             await control.fill(action.value)
                         elif action.kind == "select":
                             await control.select_option(value=action.value)
+                        elif action.kind == "combobox":
+                            await choose_combobox(page, action.field_id, action.value)
                         elif action.kind == "check":
                             await control.set_checked(action.value)
                         elif action.kind == "file":
-                            await control.set_input_files(action.value)
+                            if transport.enabled:
+                                try:
+                                    await transport.begin_upload()
+                                    await control.set_input_files(action.value)
+                                    await transport.finish_upload()
+                                except Exception:
+                                    transport.upload_active = False
+                                    return await result("needs_attention", "The hosted form's verified resume upload could not be completed; review it manually.")
+                            else:
+                                await control.set_input_files(action.value)
                     state = await snapshot()
                 else:
                     return await result("needs_attention", "The application kept changing while fields were filled.")
@@ -542,9 +622,11 @@ async def run_application(
                     arg=_CONFIRMATION,
                     timeout=15000,
                 )
-                validate_destination_url(page.url, url, allowed_hosts, fixture=fixture)
+                validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                 if blocked_requests:
                     return await result("uncertain", "A destination was blocked after the single submission attempt. Do not retry automatically.")
+                if not submission_responses or any(status >= 400 for status in submission_responses) or not any(200 <= status < 400 for status in submission_responses):
+                    return await result("uncertain", "A confirmation appeared without a successful application request. Verify the employer outcome; do not retry automatically.")
                 return await result("submitted", "The approved site displayed an application confirmation.", confirmation="Recognized application-submitted or thank-you message on the approved origin.")
             finally:
                 await browser.close()

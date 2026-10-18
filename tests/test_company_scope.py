@@ -17,14 +17,17 @@ HEADERS = {"X-JobRadar-Client": "dashboard"}
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    async def refreshed(job):
+        return {**job, "closed":False, "candidate_refresh":{"status":"verified","message":"Synthetic official refresh"}}
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
 
 
 def configure(client, **rules):
     assert client.post("/api/profile", headers=HEADERS,
-                       json={"name": "Alex Example", "email": "alex@example.test"}).status_code == 200
+                       json={"name":"Alex Example", "email":"alex@example.test", "approved_work_locations":["Boston, MA"], "work_authorized":True, "needs_sponsorship":False}).status_code == 200
     assert client.post("/api/resume", headers=HEADERS,
                        files={"file": ("resume.txt", b"Built Python services.", "text/plain")}).status_code == 200
     assert client.post("/api/rules", headers=HEADERS, json={"company_scope": "any", **rules}).status_code == 200

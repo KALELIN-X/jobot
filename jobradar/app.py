@@ -17,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
+from .destinations import SUPPORTED_HOSTS, verified_destination
 from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules, company_scope
 from .store import Store, now
 
@@ -107,28 +108,41 @@ def create_app(data_dir: Path | None = None):
             return {"message": "A fetch is already running."}
         state["fetching"] = True
         try:
-            store.event("fetch", "Checking Jobright's public software job list.")
-            jobs = await fetch_jobs(limit=40)
+            store.event("fetch", "Checking public new-grad software listings and official employer postings.")
+            jobs = await fetch_jobs(limit=100)
             _, rules, _, _ = configuration()
             jobs = await enrich_lever_jobs(jobs, rules.get("company_boards", {}))
             for job in jobs:
                 store.save_job(job)
             rank_all()
-            count = sum(bool(job.get("apply_url")) for job in jobs)
-            store.event("fetch", f"Refreshed {len(jobs)} listings; {count} have a verified employer application URL. Removed feed rows are not treated as closed jobs.")
+            _, rules, _, _ = configuration()
+            count = sum(verified_destination(job) for job in jobs)
+            ready = sum(submission_check(job, rules)["eligible"] for job in store.jobs() if not job.get("demo") and job["status"] in ("new", "queued"))
+            message = f"Fetched {len(jobs)} listings; {count} verified Lever or Greenhouse destinations. {ready} saved roles currently match your application rules."
+            summary = {"count": len(jobs), "verified_destinations": count,
+                       "direct_links": sum(bool(job.get("apply_url")) for job in jobs),
+                       "ready": ready, "message": message,
+                       "sources": sorted({job.get("source", "Jobright") for job in jobs})}
+            store.event("fetch", message + " A missing feed row is not treated as a closed job.")
             store.set("last_fetch", now())
-            return {"count": len(jobs), "verified_destinations": count}
+            store.set("last_fetch_summary", summary)
+            return summary
         finally:
             state["fetching"] = False
 
     async def run_queue():
         from .autofill import run_application
+        from .ranking import rank_job
+        from .refresh import refresh_candidate
         if queue_lock.locked():
             return
         async with queue_lock:
             state["running"] = True
             try:
                 _, queue_rules, _, _ = configuration()
+                refresh_day = datetime.now(timezone.utc).date().isoformat()
+                refresh_budget = max(0, queue_rules["daily_limit"] - store.attempt_count(refresh_day))
+                checked_candidates = 0
                 for candidate in ordered_queue(store.jobs(), queue_rules):
                     # Reload after the prior browser run: a user may have dismissed
                     # this listing or a feed refresh may have changed its details.
@@ -156,6 +170,35 @@ def create_app(data_dir: Path | None = None):
                         continue
                     if store.get("stop_requested", False):
                         break
+                    # Saved rows can outlive a bounded discovery refresh. Recheck
+                    # only candidates already passing the stored rules, then rank
+                    # their current official description before sharing any data.
+                    if checked_candidates >= refresh_budget:
+                        store.event("paused", "This run reached its bounded posting-verification budget. Remaining roles are saved for a later run.")
+                        break
+                    checked_candidates += 1
+                    refreshed = await refresh_candidate(job)
+                    profile, rules, resume, approval = configuration()
+                    if store.get("stop_requested", False) or not valid_approval(profile, rules, resume, approval) or not resume_intact(resume, data_dir):
+                        store.event("paused", "Queue paused during posting verification; review the current configuration before restarting.")
+                        break
+                    latest = store.job(job["id"])
+                    if not latest or latest["status"] not in ("new", "queued"):
+                        continue
+                    detail = rank_job(refreshed, profile, resume.get("text", ""), rules)
+                    refreshed.update(score=detail.get("score"), score_detail=detail)
+                    store.save_job(refreshed)
+                    job = store.job(job["id"])
+                    verification = refreshed.get("candidate_refresh", {})
+                    if verification.get("status") != "verified":
+                        store.update_job(job["id"], "needs_attention", error=verification.get("message", "The current employer posting could not be verified. Refresh and review this role."))
+                        continue
+                    reasons = job_problems(job, rules)
+                    if store.destination_attempted(job):
+                        reasons.append("This employer posting is already recorded as applied; automatic retry is disabled.")
+                    if reasons:
+                        store.update_job(job["id"], "needs_attention", error=" ".join(reasons))
+                        continue
                     job = store.claim_job(job["id"])
                     if not job:
                         continue
@@ -178,7 +221,7 @@ def create_app(data_dir: Path | None = None):
                             raise ValueError(" ".join(remaining))
                         store.reserve_attempt(job_id, datetime.now(timezone.utc).date().isoformat(), latest_rules["daily_limit"])
 
-                    result = await run_application(job, profile, data_dir / "resumes" / resume["stored_name"], allowed_hosts={"jobs.lever.co", "jobs.eu.lever.co"}, artifacts_dir=data_dir / "artifacts" / job["id"], submit=True, before_submit=before_submit)
+                    result = await run_application(job, profile, data_dir / "resumes" / resume["stored_name"], allowed_hosts=set(SUPPORTED_HOSTS), artifacts_dir=data_dir / "artifacts" / job["id"], submit=True, before_submit=before_submit)
                     result_status = result.get("status", "needs_attention")
                     if result_status not in {"submitted", "needs_attention", "uncertain", "failed"}:
                         result_status = "needs_attention"
@@ -261,7 +304,7 @@ def create_app(data_dir: Path | None = None):
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
             job["submission_check"] = submission_check(job, rules)
-        return {"profile": profile, "rules": rules, "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")}, "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"), "candidate_fingerprint": fingerprint(profile, rules, resume)}, "jobs": jobs, "events": store.events(), "answer_memory": answer_memory_state(profile, jobs), "stats": {"total": len(real_jobs), "queued": sum(job["status"] in ("new", "queued") for job in real_jobs), "submitted": sum(job["status"] == "submitted" for job in real_jobs), "needs_attention": sum(job["status"] in ("needs_attention", "uncertain", "failed") for job in real_jobs)}, "queue": queue_readiness(jobs, profile, rules, resume, approval), "automation": {"enabled": store.get("automation", {}).get("enabled", False), "running": worker_busy(), "fetching": state["fetching"]}, "last_fetch": store.get("last_fetch"), "setup_problems": configuration_problems(profile, rules, resume)}
+        return {"profile": profile, "rules": rules, "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")}, "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"), "candidate_fingerprint": fingerprint(profile, rules, resume)}, "jobs": jobs, "events": store.events(), "answer_memory": answer_memory_state(profile, jobs), "stats": {"total": len(real_jobs), "queued": sum(job["status"] in ("new", "queued") for job in real_jobs), "submitted": sum(job["status"] == "submitted" for job in real_jobs), "needs_attention": sum(job["status"] in ("needs_attention", "uncertain", "failed") for job in real_jobs)}, "queue": queue_readiness(jobs, profile, rules, resume, approval), "automation": {"enabled": store.get("automation", {}).get("enabled", False), "running": worker_busy(), "fetching": state["fetching"]}, "last_fetch": store.get("last_fetch"), "discovery": store.get("last_fetch_summary", {}), "setup_problems": configuration_problems(profile, rules, resume)}
 
     @app.post("/api/profile")
     async def save_profile(profile: Profile):
@@ -384,7 +427,7 @@ def create_app(data_dir: Path | None = None):
         except ValueError as error:
             raise HTTPException(400, str(error))
         if result["recorded"] or result["updated_jobs"]:
-            message = "A previous application was recorded. Listings with the same employer and title are held for review, including possible reposts." if result.get("identity_key") else "A previously submitted Lever posting was recorded. Matching listings will not be submitted automatically."
+            message = "A previous application was recorded. Listings with the same employer and title are held for review, including possible reposts." if result.get("identity_key") else "A previously submitted employer posting was recorded. Matching listings will not be submitted automatically."
             store.event("applied_elsewhere", message)
         return {"ok": True, **result}
 

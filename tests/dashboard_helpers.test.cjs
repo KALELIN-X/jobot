@@ -76,6 +76,27 @@ function queueHelpers() {
   return context.helpers;
 }
 
+test("runnable roles sort before held higher-scoring listings", () => {
+  const helpers = dashboardHelpers({prefer_new_grad:true});
+  const ready = {...job(0,false,60),submission_check:{eligible:true}};
+  const held = {...job(null,true,100),submission_check:{eligible:false}};
+  assert.ok(helpers.compareJobs(ready,held) < 0);
+  assert.equal(held.score,100);
+});
+
+test("history URL validation accepts exact Greenhouse and Lever routes only", () => {
+  const source = fs.readFileSync(path.join(__dirname,"..","static","app.js"),"utf8");
+  const start = source.indexOf("  function supportedPostingURL(");
+  const end = source.indexOf("  function externalLink(",start);
+  const context = {URL};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start,end)+"\nthis.validate = supportedPostingURL;",context);
+  assert.ok(context.validate("https://job-boards.greenhouse.io/example/jobs/1234"));
+  assert.ok(context.validate("https://boards.eu.greenhouse.io/example/jobs/1234?gh_src=test"));
+  assert.ok(context.validate("https://jobs.lever.co/example/11111111-1111-4111-8111-111111111111/apply"));
+  for (const invalid of ["https://evil.test/example/jobs/1234","https://job-boards.greenhouse.io/example/jobs/nope","https://user:pass@boards.greenhouse.io/example/jobs/1234","http://boards.greenhouse.io/example/jobs/1234"]) assert.equal(context.validate(invalid),null);
+});
+
 test("unapproved and blocked queues have an actionable review path", () => {
   const {queueControlState} = queueHelpers();
   const setup = queueControlState({approval: {approved: false}, queue: {ready: 0, can_run: false}});

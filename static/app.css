@@ -60,7 +60,7 @@ button:focus-visible,a:focus-visible{outline:3px solid #6388f1;outline-offset:3p
 .empty-radar{background:#f0f5ff;border-color:#d5e2fb}.empty-radar:before{border-color:#c2d3f1}.empty-radar:after{border-color:#a9c0e8}.empty-radar span{background:conic-gradient(from 45deg,transparent 0deg,transparent 280deg,#799de147 360deg)}.empty-radar i{background:#8a7ce0;box-shadow:0 0 0 4px #f0f5ff}
 .company-avatar{background:#edf2ff;color:#4369b4}.job-score strong{color:#3c64bd}.job-score small{color:var(--muted)}.job-score.low strong{color:#8a651f}.job-score.unknown strong{color:#687e9d}
 .tag{background:#edf2fa;color:#496287}.tag.success{background:#e5f4ef;color:#17675c}.tag.warning,.unsaved{background:#fff3dc;color:#875b17}.tag.danger{background:#fff0f0;color:#ad3d48}.tag.demo{background:#efedff;color:#6253ac}
-.eligibility-item .status-dot{background:#b0812e}.eligibility-item.pass .status-dot{background:#268477}.eligibility-item.fail .status-dot{background:#b95260}
+.eligibility-item .status-dot{background:#b0812e}.eligibility-item.pass .status-dot{background:#268477}.eligibility-item.fail .status-dot{background:#b95260}.eligibility-item.waived .status-dot{background:#71819c}.eligibility-item.waived{color:#526583}
 .job-description{background:#f5f7fc;color:#4b6080}.job-error{background:#fff1f2;color:#a53f4f}.detail-actions .text-button{color:#5b6f90}
 .demo-banner{border-color:#dcd5f7;background:#f3f0ff;color:#63569b}.simple-empty,.simple-empty p{color:var(--muted)}.simple-empty>svg{color:#839bc2}.simple-empty h3{color:#314d75}
 .notice{background:#eaf3ff;border-color:#c8dcfa;color:#28558b}.notice.error{background:#fff0f1;border-color:#efcbd1;color:#a13d4d}

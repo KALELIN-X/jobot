@@ -13,7 +13,7 @@ from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
-PROFILE = {"name": "Alex Example", "email": "alex@example.test", "location": "Boston, MA",
+PROFILE = {"name": "Alex Example", "email": "alex@example.test", "location": "Boston, MA", "approved_work_locations":["Boston, MA"],
            "work_authorized": True, "needs_sponsorship": False, "experience_months": 12,
            "graduation_date": "2027-05-15"}
 RULES = {"companies": ["Example"], "company_boards": {"Example": "example"},
@@ -21,7 +21,10 @@ RULES = {"companies": ["Example"], "company_boards": {"Example": "example"},
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    async def refreshed(job):
+        return {**job, "closed":False, "candidate_refresh":{"status":"verified","message":"Synthetic official refresh"}}
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
 

@@ -32,13 +32,13 @@ class ExternalApplicationRequest(StrictModel):
     def check_application_url(cls, value):
         from .store import application_key
         if value is not None and application_key({"apply_url": value}) is None:
-            raise ValueError("Enter an HTTPS Lever posting or application URL with a valid posting ID.")
+            raise ValueError("Enter an HTTPS Lever or Greenhouse posting URL with a valid posting ID.")
         return value
 
     @model_validator(mode="after")
     def require_listing_or_url(self):
         if self.url is None and self.job_id is None:
-            raise ValueError("Provide a saved job ID or an HTTPS Lever posting URL.")
+            raise ValueError("Provide a saved job ID or an HTTPS Lever or Greenhouse posting URL.")
         return self
 
 
@@ -58,6 +58,7 @@ class Profile(StrictModel):
     skills: list[str] = Field(default_factory=list, max_length=100)
     experience_months: int | None = Field(default=None, ge=0, le=720)
     graduation_date: str | None = None
+    graduation_month: StrictStr | None = None
     work_authorized: bool | None = None
     needs_sponsorship: bool | None = None
     answers: dict[str, StrictStr | StrictBool] = Field(default_factory=dict, max_length=60)
@@ -93,6 +94,15 @@ class Profile(StrictModel):
             raise ValueError("Skills must be nonempty and at most 100 characters each.")
         return list(dict.fromkeys(item.strip() for item in values))
 
+    @field_validator("graduation_month")
+    @classmethod
+    def check_graduation_month(cls, value):
+        if value is not None:
+            if not re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", value):
+                raise ValueError("Graduation month must use YYYY-MM; provide only a month you know.")
+            date.fromisoformat(value + "-01")
+        return value
+
     @field_validator("approved_work_locations")
     @classmethod
     def check_work_locations(cls, values):
@@ -113,13 +123,14 @@ class Rules(StrictModel):
     companies: list[str] = Field(default_factory=list, max_length=30)
     company_boards: dict[str, str] = Field(default_factory=dict, max_length=10)
     locations: list[str] = Field(default_factory=list, max_length=30)
-    allowed_ats: list[str] = Field(default_factory=lambda: ["lever"])
+    allowed_ats: list[str] = Field(default_factory=lambda: ["lever", "greenhouse"])
     min_score: int = Field(default=60, ge=0, le=100)
     max_required_experience_months: int | None = Field(default=None, strict=True, ge=0, le=120)
     prefer_new_grad: StrictBool = False
     daily_limit: int = Field(default=5, ge=1, le=20)
     interval_minutes: int = Field(default=360, ge=30, le=1440)
     require_known_eligibility: bool = True
+    enforce_graduation_window: StrictBool = True
 
     @model_validator(mode="before")
     @classmethod
@@ -145,8 +156,8 @@ class Rules(StrictModel):
     @field_validator("allowed_ats")
     @classmethod
     def check_ats(cls, values):
-        if values not in ([], ["lever"]):
-            raise ValueError("Allow Lever applications or leave automatic application systems disabled. Other systems are not supported.")
+        if len(values) != len(set(values)) or any(value not in {"lever", "greenhouse"} for value in values):
+            raise ValueError("Supported automatic application systems are Lever and Greenhouse; leave the list empty to disable them.")
         return values
 
 

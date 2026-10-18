@@ -54,7 +54,8 @@ def test_experience_limit_is_checked_directly_before_submission():
 def test_location_keywords_match_whole_phrases_and_work_model():
     configured = rules()
     configured["locations"] = ["US"]
-    assert job_problems(eligible_job(location="Austin, TX"), configured)
+    assert job_problems(eligible_job(location="Austin, Unknown region"), configured)
+    assert not job_problems(eligible_job(location="Austin, TX"), configured)
     assert not job_problems(eligible_job(location="Austin, TX, US"), configured)
     configured["locations"] = ["Remote"]
     assert not job_problems(eligible_job(location="Boston, MA", work_model="Remote"), configured)

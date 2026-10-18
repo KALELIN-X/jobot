@@ -2,49 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
-
-
-_LEVER_PATH = re.compile(
-    r"^/([A-Za-z0-9][A-Za-z0-9_-]*)/"
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/apply)?/?$"
-)
+from .destinations import application_key_from_url
 
 
 def application_key(job):
-    """Canonical Lever destination independent of feed IDs and URL tracking.
-
-    The global and EU tenants remain distinct. Lever board/UUID case variants,
-    the posting/apply suffix, and tracking parameters identify the same posting.
-    Synthetic fixtures intentionally use only their per-job attempt record.
-    """
+    """Stable supported-ATS identity, preserving all existing Lever ledger keys."""
     if job.get("demo"):
         return None
     raw = job.get("apply_url") or job.get("application_url") or job.get("url")
-    if not isinstance(raw, str) or any(char.isspace() for char in raw) or "\\" in raw:
-        return None
-    try:
-        parts = urlsplit(raw)
-        if (
-            parts.scheme != "https"
-            or parts.hostname not in {"jobs.lever.co", "jobs.eu.lever.co"}
-            or parts.username or parts.password
-            or parts.port not in (None, 443)
-        ):
-            return None
-        match = _LEVER_PATH.fullmatch(parts.path)
-        if match is None:
-            return None
-        return f"lever:{parts.hostname}/{match[1].casefold()}/{match[2].lower()}"
-    except ValueError:
-        return None
+    return application_key_from_url(raw)
 
 
 def now():
@@ -85,9 +56,10 @@ class Store:
             connection.execute("BEGIN IMMEDIATE")
             old_attempts = connection.execute("""
                 SELECT jobs.id, jobs.payload,
-                       COALESCE(attempts.created_at, jobs.attempted_at) AS created_at
+                       COALESCE(attempts.created_at, jobs.attempted_at, jobs.updated_at) AS created_at
                 FROM jobs LEFT JOIN attempts ON attempts.job_id=jobs.id
                 WHERE attempts.job_id IS NOT NULL OR jobs.attempted_at IS NOT NULL
+                      OR jobs.status IN ('submitted', 'uncertain')
                 ORDER BY created_at, jobs.id
             """).fetchall()
             for row in old_attempts:
@@ -179,9 +151,9 @@ class Store:
         """
         key = application_key({"apply_url": url}) if url is not None else None
         if url is not None and key is None:
-            raise ValueError("Enter an HTTPS Lever posting or application URL with a valid posting ID.")
+            raise ValueError("Enter an HTTPS Lever or Greenhouse posting URL with a valid posting ID.")
         if url is None and job_id is None:
-            raise ValueError("Provide a saved job ID or an HTTPS Lever posting URL.")
+            raise ValueError("Provide a saved job ID or an HTTPS Lever or Greenhouse posting URL.")
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             identity_key = None
@@ -195,7 +167,7 @@ class Store:
                     raise ValueError("The saved listing needs an employer and title; synthetic demos cannot be recorded as application history.")
                 selected_key = application_key(selected_job)
                 if url is not None and selected_key != key:
-                    raise ValueError("The provided URL does not match a verified Lever destination on the selected listing.")
+                    raise ValueError("The provided URL does not match the supported employer destination on the selected listing.")
                 key = selected_key
             recorded = False
             if key is not None:
@@ -242,7 +214,10 @@ class Store:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row or row["attempted_at"] or row["status"] not in {"new", "queued"}:
                 return None
-            if self._identity_recorded(connection, json.loads(row["payload"])):
+            current_job = json.loads(row["payload"])
+            key = application_key(current_job)
+            if ((key and connection.execute("SELECT 1 FROM destination_attempts WHERE application_key=?", (key,)).fetchone())
+                    or self._identity_recorded(connection, current_job)):
                 return None
             updated_at = now()
             connection.execute(
@@ -257,7 +232,7 @@ class Store:
             return connection.execute("SELECT COUNT(*) FROM attempts WHERE day=?", (day,)).fetchone()[0]
 
     def destination_attempted(self, job):
-        """Skip already-attempted Lever destinations before filling/uploading."""
+        """Skip already-attempted supported destinations before filling/uploading."""
         with self.connection() as connection:
             key = application_key(job)
             return bool((key and connection.execute("SELECT 1 FROM destination_attempts WHERE application_key=?", (key,)).fetchone()) or self._identity_recorded(connection, job))
@@ -277,7 +252,7 @@ class Store:
                 raise ValueError("An application with this employer and title was reported elsewhere. This may be a repost; review it before any new application.")
             key = application_key(job)
             if key and connection.execute("SELECT 1 FROM destination_attempts WHERE application_key=?", (key,)).fetchone():
-                raise ValueError("This Lever posting already has a submission attempt under another feed record.")
+                raise ValueError("This employer posting already has a submission attempt under another feed record.")
             connection.execute("INSERT INTO attempts VALUES(?,?,?)", (job_id, day, now()))
             if key:
                 connection.execute("INSERT INTO destination_attempts VALUES(?,?,?)", (key, job_id, now()))

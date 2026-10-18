@@ -34,12 +34,14 @@
   function safeURL(value) {
     try { const url = new URL(value); return ["http:","https:"].includes(url.protocol) ? url.href : null; } catch { return null; }
   }
-  function leverPostingURL(value) {
+  function supportedPostingURL(value) {
     if (typeof value !== "string" || /[\s\\]/.test(value)) return null;
     try {
       const url = new URL(value);
       const posting = /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/apply)?\/?$/i;
-      return url.protocol === "https:" && ["jobs.lever.co","jobs.eu.lever.co"].includes(url.hostname) && !url.username && !url.password && (!url.port || url.port === "443") && posting.test(url.pathname) ? url.href : null;
+      const greenhouse = ["boards.greenhouse.io","job-boards.greenhouse.io","boards.eu.greenhouse.io","job-boards.eu.greenhouse.io"].includes(url.hostname) && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/jobs\/[0-9]+\/?$/.test(url.pathname);
+      const lever = ["jobs.lever.co","jobs.eu.lever.co"].includes(url.hostname) && posting.test(url.pathname);
+      return url.protocol === "https:" && (lever || greenhouse) && !url.username && !url.password && (!url.port || url.port === "443") ? url.href : null;
     } catch { return null; }
   }
   function externalLink(url, label, className = "button button-secondary") {
@@ -172,6 +174,8 @@
     return job.score_detail?.is_new_grad === true && (maximum === null || experienceVisible(job,maximum));
   }
   function compareJobs(a,b) {
+    const ready = Number(b.submission_check?.eligible === true) - Number(a.submission_check?.eligible === true);
+    if (ready) return ready;
     if (state.rules?.prefer_new_grad) {
       const priority = Number(newGradPriority(b)) - Number(newGradPriority(a));
       if (priority) return priority;
@@ -186,9 +190,10 @@
     const maximum = experienceLimit();
     $("#experience-filter-bar").hidden = maximum === null;
     $("#experience-filter").checked = experienceFilterEnabled;
-    $(".sort-label").innerHTML = state.rules?.prefer_new_grad ? "New grads, then fit <span>↓</span>" : "Highest fit first <span>↓</span>";
+    $(".sort-label").innerHTML = state.rules?.prefer_new_grad ? "Ready, new grads, fit <span>↓</span>" : "Ready, then fit <span>↓</span>";
     const jobs = allJobs.filter(job => {
       const status = String(job.status || "").toLowerCase();
+      if (filter === "ready" && job.submission_check?.eligible !== true) return false;
       if (filter === "queued" && !["new","queued"].includes(status)) return false;
       if (filter === "attention" && !jobAttention(job)) return false;
       if (filter === "submitted" && status !== "submitted") return false;
@@ -220,25 +225,25 @@
     const evidence = items => list(items).length ? `<ul class="detail-list">${list(items).map(item => `<li>${escape(typeof item === "object" ? item.label || item.detail || JSON.stringify(item) : item)}</li>`).join("")}</ul>` : `<p class="detail-empty">${state.resume?.loaded ? "None identified." : "Upload your resume to assess fit."}</p>`;
     const eligibility = list(detail.eligibility).map(item => {
       const status = String(item.status || "unknown").toLowerCase();
-      const cls = ["pass","eligible","met","yes","true","confirmed"].includes(status) ? "pass" : ["fail","ineligible","not_met","no","false"].includes(status) ? "fail" : "unknown";
+      const cls = status === "waived" ? "waived" : ["pass","eligible","met","yes","true","confirmed"].includes(status) ? "pass" : ["fail","ineligible","not_met","no","false"].includes(status) ? "fail" : "unknown";
       return `<div class="eligibility-item ${cls}"><span class="status-dot"></span><span><strong>${escape(item.label || "Eligibility")}</strong> · ${escape(item.detail || status.replaceAll("_"," "))}</span></div>`;
     }).join("");
     const status = String(job.status).toLowerCase();
     const isSubmitted = status === "submitted";
     const hideJobActions = isDemo(job) || Boolean(job.attempted_at) || ["active","filling","submitting","applying","uncertain","applied_elsewhere"].includes(status);
     const canRecordApplied = !hideJobActions && !isSubmitted;
-    const priorApplicationHelp = canRecordApplied && !leverPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact Lever posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
+    const priorApplicationHelp = canRecordApplied && !supportedPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact supported posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
     const checks = list(job.submission_check?.blockers);
     const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-memory">Answer new application questions →</button>' : ""}` : "";
     const submissionInfo = isSubmitted ? [...new Set([job.message,job.confirmation,job.error].filter(Boolean).map(value => typeof value === "object" ? JSON.stringify(value) : String(value)))].join(" ") : "";
-    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div><div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${!hideJobActions && !isSubmitted && !["new","queued"].includes(status) ? `<button type="button" class="button button-secondary" data-action="queue" data-id="${escape(id)}">Add to queue${icon("arrow")}</button>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+    return `<article class="job-card" data-job-id="${escape(id)}"><div class="job-card-top"><div class="company-avatar" aria-hidden="true">${escape(initials)}</div><div class="job-heading"><div class="job-company">${escape(job.company || "Company not provided")}</div><h3 class="job-title">${escape(job.title || "Untitled role")}</h3><div class="job-meta"><span>${escape(job.location || "Location not provided")}</span>${job.work_model ? `<span>${escape(job.work_model)}</span>` : ""}<span title="Date listed by the discovery feed; the original posting date may differ.">${escape(relativeDate(job.date_posted,"Feed listed "))}</span></div></div><div class="job-score ${scoreClass}"><strong>${score === null ? "—" : score}</strong><small>${score === null ? "FIT UNKNOWN" : "RESUME FIT"}</small></div></div><div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.eligible === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${!isDemo(job) ? `<span class="tag" title="${escape(list(detail.experience_requirement?.evidence).join(" "))}">${escape(experienceLabel(detail.experience_requirement,detail.is_new_grad === true))}</span>${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}` : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "View details"}${icon("chevron")}</button></div><div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}<div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${job.description ? `<div class="detail-label">About the role</div><div class="job-description">${escape(job.description)}</div>` : ""}${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${!hideJobActions && !isSubmitted && !["new","queued"].includes(status) ? `<button type="button" class="button button-secondary" data-action="queue" data-id="${escape(id)}">Add to queue${icon("arrow")}</button>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
     const resumeReady = Boolean(state.resume?.loaded);
     const companies = list(state.rules?.companies);
     const anyCompany = companyScope(state.rules) === "any";
-    const rulesReady = (anyCompany || companies.length > 0) && list(state.rules?.allowed_ats).includes("lever");
+    const rulesReady = (anyCompany || companies.length > 0) && list(state.rules?.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats));
     const approved = Boolean(state.approval?.approved);
     $("#readiness-title").textContent = approved ? "Ready when you are" : "Before your first run";
     $("#readiness-description").textContent = approved ? "Your saved rules are approved. You decide when to put them to work." : "A few essentials keep every application intentional.";
@@ -292,7 +297,7 @@
     if (!snapshot.resume?.loaded) return {view:"profile",selector:"#resume-file"};
     const companies = list(snapshot.rules?.companies);
     if (companyScope(snapshot.rules) === "selected" && !companies.length) return {view:"rules",selector:'#rules-form [name="companies"]'};
-    if (!list(snapshot.rules?.allowed_ats).includes("lever")) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
+    if (!list(snapshot.rules?.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats))) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
     return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="min_score"]' : "#approval-acknowledge"};
   }
   function openQueueReview() {
@@ -368,8 +373,8 @@
     const profile = approvalReview.profile;
     const companies = list(rules.companies);
     const selected = companyScope(rules) === "selected";
-    const fields = [["Applicant",profile.name || "Not saved"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Company scope",selected ? `${companies.length} selected companies` : "Any company from fetched jobs, including future matches"],["Location",list(rules.locations).length ? locationMode(rules.locations) === "us" ? "Anywhere in the U.S." : list(rules.locations).join(", ") : "Any location"],["Experience required",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "None" : `Up to ${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["New grads first",rules.prefer_new_grad ? "Yes" : "No"],["Minimum match",`${rules.min_score ?? "—"} / 100`],["Daily limit",`${rules.daily_limit ?? "—"} attempts (UTC day)`],["Schedule interval",`${rules.interval_minutes ?? "—"} minutes`],["Unclear eligibility",rules.require_known_eligibility === false ? "Review not required" : "Pause for review"]];
-    const applicantFields = [["Legal first name",profile.first_name],["Legal last name",profile.last_name],["Preferred name",profile.preferred_first_name],["Email",profile.email],["Phone",profile.phone],["Current location",profile.location],["Approved work locations",list(profile.approved_work_locations).join("; ")],["LinkedIn",profile.linkedin],["GitHub",profile.github],["Portfolio",profile.portfolio],["Skills",list(profile.skills).join(", ")],["Experience months",profile.experience_months],["Graduation",profile.graduation_date],["Work authorized",profile.work_authorized == null ? "Not provided" : profile.work_authorized ? "Yes" : "No"],["Sponsorship needed",profile.needs_sponsorship == null ? "Not provided" : profile.needs_sponsorship ? "Yes" : "No"]];
+    const fields = [["Applicant",profile.name || "Not saved"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Company scope",selected ? `${companies.length} selected companies` : "Any company from fetched jobs, including future matches"],["Location",list(rules.locations).length ? locationMode(rules.locations) === "us" ? "Anywhere in the U.S." : list(rules.locations).join(", ") : "Any location"],["Experience required",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "None" : `Up to ${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["New grads first",rules.prefer_new_grad ? "Yes" : "No"],["Graduation windows",rules.enforce_graduation_window === false ? "Not enforced; actual dates used" : "Enforced"],["Supported forms",list(rules.allowed_ats).join(", ") || "Disabled"],["Minimum match",`${rules.min_score ?? "—"} / 100`],["Daily limit",`${rules.daily_limit ?? "—"} attempts (UTC day)`],["Schedule interval",`${rules.interval_minutes ?? "—"} minutes`],["Unclear eligibility",rules.require_known_eligibility === false ? "Review not required" : "Pause for review"]];
+    const applicantFields = [["Legal first name",profile.first_name],["Legal last name",profile.last_name],["Preferred name",profile.preferred_first_name],["Email",profile.email],["Phone",profile.phone],["Current location",profile.location],["Approved work locations",list(profile.approved_work_locations).join("; ")],["LinkedIn",profile.linkedin],["GitHub",profile.github],["Portfolio",profile.portfolio],["Skills",list(profile.skills).join(", ")],["Experience months",profile.experience_months],["Graduation",profile.graduation_date || profile.graduation_month],["Work authorized",profile.work_authorized == null ? "Not provided" : profile.work_authorized ? "Yes" : "No"],["Sponsorship needed",profile.needs_sponsorship == null ? "Not provided" : profile.needs_sponsorship ? "Yes" : "No"]];
     const applicantReview = applicantFields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value ?? "Not provided")}</strong></div>`).join("");
     const answerReview = Object.entries(profile.answers || {}).map(([question,answer]) => `<div class="approval-row"><span>${escape(question)}</span><strong>${escape(typeof answer === "boolean" ? answer ? "Yes" : "No" : answer)}</strong></div>`).join("");
     const stale = Boolean(approvalReview.fingerprint && approvalReview.fingerprint !== fingerprint);
@@ -450,7 +455,7 @@
     const rulesForm = $("#rules-form");
     if (!dirty.profile && (!profileForm.contains(document.activeElement) || !initialized.profile)) {
       const profile = state.profile || {};
-      ["name","first_name","last_name","preferred_first_name","email","phone","location","linkedin","github","portfolio","current_company","experience_months","graduation_date"].forEach(name => { profileForm.elements[name].value = profile[name] ?? ""; });
+      ["name","first_name","last_name","preferred_first_name","email","phone","location","linkedin","github","portfolio","current_company","experience_months","graduation_date","graduation_month"].forEach(name => { profileForm.elements[name].value = profile[name] ?? ""; });
       ["work_authorized","needs_sponsorship"].forEach(name => { profileForm.elements[name].value = profile[name] === true ? "true" : profile[name] === false ? "false" : ""; });
       profileForm.elements.skills.value = list(profile.skills).join("\n");
       profileForm.elements.approved_work_locations.value = list(profile.approved_work_locations).join("\n");
@@ -476,8 +481,9 @@
       ["min_score","daily_limit","interval_minutes"].forEach(name => { if (rules[name] !== undefined && rules[name] !== null) rulesForm.elements[name].value = rules[name]; });
       rulesForm.elements.max_required_experience_months.value = rules.max_required_experience_months ?? "";
       rulesForm.elements.prefer_new_grad.checked = rules.prefer_new_grad === true;
+      rulesForm.elements.enforce_graduation_window.checked = rules.enforce_graduation_window !== false;
       rulesForm.elements.require_known_eligibility.checked = rules.require_known_eligibility !== false;
-      rulesForm.elements.allowed_ats.checked = list(rules.allowed_ats).includes("lever");
+      rulesForm.elements.allowed_ats.checked = list(rules.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats));
       $("#score-output").value = rulesForm.elements.min_score.value;
       initialized.rules = true;
     }
@@ -494,8 +500,9 @@
     $("#nav-queue-count").textContent = formatNumber(state.queue?.pending ?? stats.queued ?? 0);
     $("#resume-status").textContent = state.resume?.loaded ? state.resume.filename || "Resume uploaded" : "No resume uploaded";
     $("#resume-status").classList.toggle("loaded",Boolean(state.resume?.loaded));
-    $("#source-message").textContent = sourceMessage;
-    $("#source-message").hidden = !sourceMessage;
+    const discoveryMessage = sourceMessage || state.discovery?.message || "";
+    $("#source-message").textContent = discoveryMessage;
+    $("#source-message").hidden = !discoveryMessage;
     hydrateForms();
     renderSummary();
     renderControls();
@@ -573,7 +580,7 @@
     } else if (name === "applied-elsewhere") {
       const job = list(state.jobs).find(item => String(item.id) === id);
       if (!job || isDemo(job) || job.attempted_at || ["submitted","applied_elsewhere","active","filling","submitting","applying","uncertain"].includes(String(job.status).toLowerCase())) return;
-      const canonical = Boolean(leverPostingURL(job.apply_url));
+      const canonical = Boolean(supportedPostingURL(job.apply_url));
       action(`job-${id}`,button,() => post("/api/applied-elsewhere",{job_id:id}),canonical ? "Previous application recorded. Jobot will skip this exact Lever posting." : "Previous application recorded. Listings with the same company and title will be held for review.");
     } else if (name === "demo") {
       action("demo",button,async () => { await post("/api/demo"); setView("queue"); },"Local demo created. It uses a mock employer and sends no application to a real company.");
@@ -609,9 +616,9 @@
     event.preventDefault();
     const form = event.currentTarget;
     const input = $("#history-url");
-    const url = leverPostingURL(input.value.trim());
-    if (!url) { showNotice("Enter an exact HTTPS Lever posting or application URL, including its posting ID.",true); input.focus(); return; }
-    action("history",$("button[type=submit]",form),async () => { await post("/api/applied-elsewhere",{url}); input.value = ""; },"Previous application recorded locally. This exact Lever posting will be skipped.");
+    const url = supportedPostingURL(input.value.trim());
+    if (!url) { showNotice("Enter an exact HTTPS Lever or Greenhouse posting URL, including its posting ID.",true); input.focus(); return; }
+    action("history",$("button[type=submit]",form),async () => { await post("/api/applied-elsewhere",{url}); input.value = ""; },"Previous application recorded locally. This exact employer posting will be skipped.");
   });
   $("#profile-form").addEventListener("input",() => markDirty("profile"));
   $("#rules-form").addEventListener("input",() => { markDirty("rules"); $("#score-output").value = $("#min-score").value; renderRuleForm(); });
@@ -630,6 +637,7 @@
     body.approved_work_locations = splitLines(form.elements.approved_work_locations.value);
     body.experience_months = form.elements.experience_months.value === "" ? null : Number(form.elements.experience_months.value);
     body.graduation_date = form.elements.graduation_date.value || null;
+    body.graduation_month = form.elements.graduation_month.value || null;
     body.work_authorized = booleanValue(form.elements.work_authorized.value);
     body.needs_sponsorship = booleanValue(form.elements.needs_sponsorship.value);
     body.answers = answers;
@@ -641,9 +649,10 @@
     const selected = form.elements.company_scope.value === "selected";
     const where = form.elements.location_mode.value;
     const locations = where === "us" ? ["United States","USA","U.S.","US"] : where === "remote" ? ["Remote"] : where === "custom" ? exactLines(form.elements.locations.value) : [];
-    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever"] : [],min_score:Number(form.elements.min_score.value),daily_limit:Number(form.elements.daily_limit.value),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
+    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever","greenhouse"] : [],min_score:Number(form.elements.min_score.value),daily_limit:Number(form.elements.daily_limit.value),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
     body.max_required_experience_months = form.elements.max_required_experience_months.value === "" ? null : Number(form.elements.max_required_experience_months.value);
     body.prefer_new_grad = form.elements.prefer_new_grad.checked;
+    body.enforce_graduation_window = form.elements.enforce_graduation_window.checked;
     action("rules",$("button[type=submit]",form),async () => { const result = await post("/api/rules",body); markSaved("rules"); return result; },"Preferences saved. Review the updated summary to approve.").then(result => {
       if (!result?.ok) return;
       renderSummary(true);

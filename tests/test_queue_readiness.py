@@ -177,7 +177,7 @@ def test_unchecked_lever_preference_saves_but_cannot_approve_or_run(client):
     assert client.post("/api/automation", headers=HEADERS, json={"enabled": True}).status_code == 409
 
 
-@pytest.mark.parametrize("ats", [["greenhouse"], ["lever", "workday"], ["lever", "lever"]])
+@pytest.mark.parametrize("ats", [["ashby"], ["lever", "workday"], ["lever", "lever"]])
 def test_rules_still_reject_unsupported_application_systems(client, ats):
     response = client.post("/api/rules", headers=HEADERS, json={**RULES, "allowed_ats": ats})
     assert response.status_code == 422

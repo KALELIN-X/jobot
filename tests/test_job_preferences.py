@@ -14,7 +14,10 @@ BASE_RULES = {"companies": ["Example"], "company_boards": {"Example": "example"}
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    async def refreshed(job):
+        return {**job, "closed":False, "candidate_refresh":{"status":"verified","message":"Synthetic official refresh"}}
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
 
@@ -52,7 +55,7 @@ def test_queue_preference_changes_priority_without_changing_fit_scores(prefer_ne
 
 
 def configure_and_approve(client, **preferences):
-    assert client.post("/api/profile", headers=HEADERS, json={"name": "Alex Example", "email": "alex@example.test"}).status_code == 200
+    assert client.post("/api/profile", headers=HEADERS, json={"name":"Alex Example", "email":"alex@example.test", "approved_work_locations":["Boston"], "work_authorized":True, "needs_sponsorship":False}).status_code == 200
     assert client.post("/api/rules", headers=HEADERS, json={**BASE_RULES, **preferences}).status_code == 200
     assert client.post("/api/resume", headers=HEADERS, files={"file": ("resume.txt", b"Built Python APIs", "text/plain")}).status_code == 200
     fingerprint = client.get("/api/state").json()["approval"]["candidate_fingerprint"]
@@ -102,4 +105,4 @@ def test_running_queue_uses_preference_then_unchanged_fit_score(client, monkeypa
     while client.get("/api/state").json()["automation"]["running"] and time.monotonic() < deadline:
         time.sleep(0.01)
     assert [identifier for identifier, _ in observed] == expected
-    assert dict(observed) == {"new-grad": 70, "experienced": 95}
+    assert dict(observed) == {"new-grad":100, "experienced":100}  # Current official descriptions are reranked before filling.

@@ -20,6 +20,7 @@ import httpx
 
 from .autofill import LEVER_HOSTS, URLNotApproved, validate_application_url
 from .store import application_key
+from .destinations import SIMPLIFY_SOURCE_URL
 
 SOURCE_URL = "https://raw.githubusercontent.com/jobright-ai/2026-Software-Engineer-New-Grad/master/README.md"
 MAX_JOBS = 100
@@ -212,16 +213,23 @@ def parse_markdown(markdown: str, limit: int = 40) -> list[dict]:
 
 
 def _allowed_fetch_url(url: str) -> bool:
-    if url == SOURCE_URL:
+    if url in {SOURCE_URL, SIMPLIFY_SOURCE_URL}:
         return True
     if canonical_detail_url(url) == url:
         return True
     try:
         parts = urlsplit(url)
         prefix = "/v0/postings/"
-        return (parts.scheme == "https" and parts.netloc == "api.lever.co"
-                and parts.path.startswith(prefix) and bool(_BOARD.fullmatch(parts.path[len(prefix):]))
-                and parts.query == "mode=json" and not parts.fragment)
+        if parts.scheme != "https" or parts.fragment or parts.username or parts.password:
+            return False
+        if parts.netloc in {"api.lever.co", "api.eu.lever.co"} and parts.path.startswith(prefix):
+            path = parts.path[len(prefix):]
+            if _BOARD.fullmatch(path):
+                return parts.query == "mode=json"
+            return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}/[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", path)) and not parts.query
+        return (parts.netloc == "boards-api.greenhouse.io"
+                and bool(re.fullmatch(r"/v1/boards/[A-Za-z0-9][A-Za-z0-9_-]{0,79}/jobs/[1-9][0-9]{0,19}", parts.path))
+                and parts.query == "content=true")
     except (TypeError, ValueError):
         return False
 
@@ -240,8 +248,8 @@ async def _fetch_text(client: httpx.AsyncClient, url: str, max_bytes: int) -> st
                 if not _allowed_fetch_url(redirected):
                     raise ValueError("Blocked redirect outside the fixed public-source allowlist")
                 # A configured Lever board must never redirect into another board.
-                if urlsplit(url).hostname == "api.lever.co" and redirected != url:
-                    raise ValueError("Lever board redirect is not allowed")
+                if urlsplit(url).hostname in {"api.lever.co", "api.eu.lever.co", "boards-api.greenhouse.io"} and redirected != url:
+                    raise ValueError("Employer posting redirect is not allowed")
                 url = redirected
                 continue
             response.raise_for_status()
@@ -462,7 +470,7 @@ def _client() -> httpx.AsyncClient:
                              headers={"User-Agent": "JobRadar/1.0 (public job metadata reader)"})
 
 
-async def fetch_jobs(limit: int = 40) -> list[dict]:
+async def fetch_jobright_jobs(limit: int = 40) -> list[dict]:
     """Fetch at most 100 current rows and resolve details with three workers.
 
     A repository failure raises RuntimeError (there are no metadata rows to return).
@@ -613,3 +621,9 @@ async def enrich_lever_jobs(jobs: list[dict], company_boards: dict[str, str]) ->
                         job["lever_resolution"] = _error_message(error)
         await asyncio.gather(*(resolve_board(board, candidates) for board, candidates in groups.items()))
     return jobs
+
+
+async def fetch_jobs(limit: int = 100) -> list[dict]:
+    """Prefer direct source-published employer links, with a bounded fallback."""
+    from .sources import fetch_public_jobs
+    return await fetch_public_jobs(limit=limit)
