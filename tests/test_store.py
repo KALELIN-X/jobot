@@ -18,16 +18,32 @@ def test_feed_refresh_preserves_review_questions_and_confirmation_but_not_old_de
     store = Store(tmp_path / "db.sqlite3")
     store.save_job(job(destination_provenance={"old": "source"}))
     question = {"question": "Preferred editor?", "type": "text"}
-    store.update_job("first", "needs_attention", pending_questions=[question], confirmation="Recorded receipt", error="Review needed")
+    store.update_job("first", "needs_attention", pending_questions=[question], form_questions=[question],
+                     questions_refreshed_at="2026-10-18T12:00:00+00:00", confirmation="Recorded receipt", error="Review needed")
     store.save_job(job(title="Fresh title", apply_url=None, destination_provenance=None))
     saved = store.job("first")
     assert saved["title"] == "Fresh title"
     assert saved["status"] == "needs_attention"
     assert saved["pending_questions"] == [question]
+    assert saved["form_questions"] == [question]
+    assert saved["questions_refreshed_at"] == "2026-10-18T12:00:00+00:00"
     assert saved["confirmation"] == "Recorded receipt"
     assert saved["error"] == "Review needed"
     assert saved["apply_url"] is None
     assert saved["destination_provenance"] is None
+
+
+def test_feed_cannot_replace_explicitly_refreshed_question_metadata_with_stale_payload(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    store.save_job(job())
+    store.update_job("first", "needs_attention", form_questions=[], pending_questions=[],
+                     questions_refreshed_at="2026-10-18T12:30:00+00:00")
+    store.save_job(job(title="Fresh source title", form_questions=[{"question": "Stale source question"}],
+                       questions_refreshed_at="2020-01-01T00:00:00+00:00"))
+    refreshed = store.job("first")
+    assert refreshed["title"] == "Fresh source title"
+    assert refreshed["form_questions"] == refreshed["pending_questions"] == []
+    assert refreshed["questions_refreshed_at"] == "2026-10-18T12:30:00+00:00"
 
 
 @pytest.mark.parametrize("variant", [

@@ -198,3 +198,89 @@ def test_unknown_questions_are_preserved_for_review_without_a_submission_attempt
     assert state["answer_memory"]["pending"][0]["question"] == question["question"]
     assert state["answer_memory"]["pending"][0]["job_id"] == "question-needed"
     assert not state["queue"]["can_run"]
+
+
+def test_worker_choices_replace_old_inspection_in_inbox_and_job_bound_answer_save(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "changed-choices")
+    store = client.app.state.store
+    old = {"question": "Which shift?", "type": "select", "required": True,
+           "options": [{"label": "Day", "value": "day"}]}
+    current = {**old, "options": [{"label": "Night", "value": "night"}]}
+    unrelated = {"question": "Preferred editor?", "type": "text", "required": False, "options": []}
+    store.update_job("changed-choices", "queued", form_questions=[old, unrelated],
+                     pending_questions=[], questions_refreshed_at="2020-01-01T00:00:00+00:00")
+
+    async def changed_form(job, profile, resume_path, **options):
+        assert job["form_questions"] == [old, unrelated]
+        return {"status": "needs_attention", "message": "A current shift answer is needed.",
+                "pending_questions": [current]}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", changed_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    saved = store.job("changed-choices")
+    assert saved["form_questions"] == [unrelated, current]
+    assert saved["questions_refreshed_at"] != "2020-01-01T00:00:00+00:00"
+    inbox = next(item for item in state["answer_memory"]["pending"] if item["job_id"] == "changed-choices")
+    assert inbox["options"] == current["options"]
+    rejected = client.post("/api/answers", headers=HEADERS,
+                           json={"job_id": "changed-choices", "question": "Which shift?", "answer": "Day"})
+    assert rejected.status_code == 422
+    accepted = client.post("/api/answers", headers=HEADERS,
+                           json={"job_id": "changed-choices", "question": "Which shift?", "answer": "Night"})
+    assert accepted.status_code == 200, accepted.text
+    assert store.get("profile")["answers"]["Which shift?"] == "Night"
+    source = client.get("/api/state").json()["answer_memory"]["saved"][0]["sources"][0]
+    assert source["options"] == current["options"]
+    assert unrelated in store.job("changed-choices")["form_questions"]
+    assert saved["attempted_at"] is None
+
+
+@pytest.mark.parametrize("existing_conflict", [False, True])
+def test_worker_question_merge_keeps_distinct_same_label_controls_for_manual_review(client, monkeypatch, existing_conflict):
+    configure_and_approve(client)
+    add_job(client, "conflicting-controls")
+    store = client.app.state.store
+    old = {"question": "Which shift?", "type": "select", "required": True,
+           "options": [{"label": "Day", "value": "day"}]}
+    other_control = {"question": "Which shift?", "type": "text", "required": True, "options": []}
+    current = {**old, "options": [{"label": "Night", "value": "night"}]}
+    prior = [old, other_control] if existing_conflict else [old]
+    incoming = [current] if existing_conflict else [current, other_control]
+    store.update_job("conflicting-controls", "queued", form_questions=prior)
+
+    async def conflicting_form(*args, **kwargs):
+        return {"status": "needs_attention", "message": "Conflicting controls need review.",
+                "pending_questions": incoming}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", conflicting_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    recorded = store.job("conflicting-controls")["form_questions"]
+    assert current in recorded and other_control in recorded
+    inbox = state["answer_memory"]["pending"][0]
+    assert inbox["conflicting_controls"] is True and inbox["options"] == []
+    result = client.post("/api/answers", headers=HEADERS,
+                         json={"job_id": "conflicting-controls", "question": "Which shift?", "answer": "Night"})
+    assert result.status_code == 409
+    assert not store.get("profile").get("answers")
+
+
+def test_worker_without_new_questions_preserves_prior_observations(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "unchanged-observations")
+    recorded = {"question": "Preferred editor?", "type": "text", "required": False, "options": []}
+    store = client.app.state.store
+    store.update_job("unchanged-observations", "queued", form_questions=[recorded],
+                     questions_refreshed_at="2020-01-01T00:00:00+00:00")
+
+    async def failed_form(*args, **kwargs):
+        return {"status": "failed", "message": "Synthetic form could not be opened."}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", failed_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    await_idle(client)
+    saved = store.job("unchanged-observations")
+    assert saved["form_questions"] == [recorded]
+    assert saved["questions_refreshed_at"] == "2020-01-01T00:00:00+00:00"

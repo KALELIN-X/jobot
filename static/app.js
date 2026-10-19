@@ -25,6 +25,8 @@
   let connectionLost = false;
   let lastInboxSignature = "";
   const questionDrafts = new Map();
+  const questionSearches = new Map();
+  const questionSources = new Map();
   let currentView = "queue";
   let approvalReview = null;
   let lastMemorySignature = "";
@@ -102,7 +104,7 @@
     if (busyActions.has(name)) return;
     busyActions.add(name);
     const previousHTML = button?.innerHTML;
-    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); if (name === "queue-matching") button.textContent = "Loading jobs to queue…"; }
+    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); if (name === "queue-matching") button.textContent = "Loading jobs to queue…"; else if (name.startsWith("questions-")) button.textContent = button.dataset.action === "search-choices" ? "Searching choices…" : "Reading form…"; }
     try {
       const result = await task();
       await refresh(true);
@@ -263,6 +265,7 @@
     const isSubmitted = status === "submitted";
     const hideJobActions = isDemo(job) || Boolean(job.attempted_at) || ["active","filling","submitting","applying","uncertain","applied_elsewhere"].includes(status);
     const canRecordApplied = !hideJobActions && !isSubmitted;
+    const canRefreshQuestions = canRecordApplied && status !== "dismissed" && Boolean(supportedPostingURL(job.apply_url));
     const priorApplicationHelp = canRecordApplied && !supportedPostingURL(job.apply_url) ? '<p class="history-help">Already applied? Without an exact supported posting URL, recording this role also holds future listings with the same company and title for review.</p>' : "";
     const checks = list(job.submission_check?.blockers);
     const preflight = !isDemo(job) && !isSubmitted ? `<div class="detail-label">Submission checks</div>${checks.length ? `<ul class="queue-blockers">${checks.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul>` : '<p class="detail-empty">This role passes saved job rules. Configuration approval and daily limits still apply.</p>'}${list(state.answer_memory?.pending).some(item => item.job_id === job.id) ? '<button type="button" class="text-button" data-action="open-questions" data-id="' + escape(id) + '">Answer new application questions →</button>' : ""}` : "";
@@ -281,7 +284,7 @@
       ${quickActions}${observed}
       <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}
         <details class="fit-explanation"><summary>Score evidence & eligibility</summary><div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${sourceEvidence.length ? `<div class="detail-label">Job fact source excerpts</div>${evidence([...new Set(sourceEvidence)])}` : ""}</details>
-        ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+        ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${canRefreshQuestions ? `<button type="button" class="button button-secondary" data-action="refresh-questions" data-id="${escape(id)}">Refresh form questions</button>` : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
@@ -423,37 +426,56 @@
     const capture = job?.browser_capture_available ? `<a href="/api/jobs/${encodeURIComponent(job.id)}/screenshot" class="text-button" target="_blank" rel="noopener">View last browser capture ↗</a>` : "";
     $("#worker-content").innerHTML = `${run.active_job ? `<p class="worker-role">${escape(run.active_job.title)}</p>` : ""}<div class="worker-current-step">${icon("activity")}<strong>${escape(run.message || "Waiting for an observed worker step")}</strong></div><div class="worker-counts">${counts}<span>${run.processed ?? 0} / ${run.total ?? 0} selected roles processed</span><span>${run.submitted ?? 0} confirmed · ${run.needs_attention ?? 0} need review · ${run.failed ?? 0} failed · ${run.uncertain ?? 0} uncertain</span></div><p class="worker-sync">${connectionLost ? `Connection lost. Last server contact ${elapsedLabel(new Date(lastSyncAt).toISOString())}. This is a saved status, not proof that the worker is still running.` : `${view.active ? `Worker heartbeat ${escape(elapsedLabel(run.heartbeat_at))}. ` : ""}Last observed step ${escape(elapsedLabel(run.updated_at))}.`}</p>${run.status === "stopping" ? '<p class="worker-sync">Stopping before the next submission. An application already sent cannot be undone.</p>' : ""}${job?.error ? `<p class="worker-error">${escape(job.error)}</p>` : ""}${pending ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(job.id)}">Review ${pending} question${pending === 1 ? "" : "s"} in Activity</button>` : ""}${capture}<details class="worker-timeline" ${timelineOpen ? "open" : ""}><summary>Observed steps from this run</summary><ol>${timeline || '<li>No browser step has been reported yet.</li>'}</ol></details>`;
   }
+  function answerContext(saved) {
+    const sources = list(saved.sources);
+    const source = sources.find(item => item.job_id === questionSources.get(saved.question)) || sources[0];
+    return source ? {...saved,...source,question:saved.question,answer:saved.answer} : null;
+  }
+  function recordedQuestion(jobId, question) {
+    return list(state.answer_memory?.pending).find(item => item.job_id === jobId && item.question === question)
+      || list(state.answer_memory?.saved).flatMap(saved => list(saved.sources).map(source => ({...saved,...source,question:saved.question}))).find(item => item.job_id === jobId && item.question === question);
+  }
+  function questionCard(item, saved = null) {
+    const key = `${item.job_id}:${item.question}`;
+    const signature = JSON.stringify([item.type,item.options]);
+    const draft = questionDrafts.get(key);
+    const options = item.type === "checkbox" ? [{label:"Yes",value:true},{label:"No",value:false}] : list(item.options);
+    const previous = saved ? options.findIndex(option => option.label === String(saved.answer) || String(option.value) === String(saved.answer)) : -1;
+    const value = draft?.signature === signature ? draft.value : previous >= 0 ? String(previous) : "";
+    const multiple = item.multiple === true || /(?:mark|select|choose) all (?:that )?apply/i.test(item.question);
+    const choice = ["select","radio"].includes(item.type);
+    const unsupported = item.type === "unsupported" || item.conflicting_controls === true;
+    const unavailable = unsupported || choice && (!options.length || multiple);
+    const searchable = item.type === "select" && item.searchable === true && !multiple;
+    const searchValue = questionSearches.get(key) ?? (typeof state.profile?.answers?.[item.question] === "string" ? state.profile.answers[item.question] : "");
+    const searchControl = searchable ? `<div class="choice-search"><label class="field">Search the employer’s choices<input name="lookup_query" type="text" maxlength="240" value="${escape(searchValue)}" placeholder="Type to search"></label><button type="button" class="button button-secondary" data-action="search-choices">Search choices</button></div><p class="field-hint">Search first, then choose an actual returned option. Search text is not saved as your answer.</p>` : "";
+    let controls;
+    if (unavailable) controls = `<p class="question-unavailable">${unsupported ? "This question has conflicting or unsupported controls and needs manual review on the employer form." : multiple ? "This control allows multiple selections and needs manual review. Optional questions can stay blank." : searchable ? "Type a search to load the employer’s available choices." : "Choices have not been loaded. Refresh the form questions to read the current dropdown."}</p>`;
+    else if (options.length && options.length <= 6) controls = `<fieldset class="question-options"><legend>Choose your answer</legend>${options.map((option,index) => `<label><input type="radio" name="choice" value="${index}" ${value === String(index) ? "checked" : ""} required><span>${escape(option.label)}</span></label>`).join("")}</fieldset>`;
+    else if (options.length) controls = `<label class="field">Your answer<select name="choice" required><option value="">Choose an available answer</option>${options.map((option,index) => `<option value="${index}" ${value === String(index) ? "selected" : ""}>${escape(option.label)}</option>`).join("")}</select></label>`;
+    else controls = `<label class="field">Your answer<textarea name="answer" rows="2" maxlength="4000" required>${escape(draft?.signature === signature ? draft.value : saved?.answer ?? "")}</textarea></label>`;
+    const context = saved && list(saved.sources).length > 1 ? `<label class="field">Application choices<select name="question_source" data-question="${escape(item.question)}">${saved.sources.map(source => `<option value="${escape(source.job_id)}" ${source.job_id === item.job_id ? "selected" : ""}>${escape(source.company)} · ${escape(source.title)}</option>`).join("")}</select></label>` : "";
+    return `<form class="activity-answer-form" data-job-id="${escape(item.job_id)}" data-question="${escape(item.question)}" data-options-signature="${escape(signature)}"><div class="answer-context">${escape(item.company)} · ${escape(item.title)} · ${item.required ? "Required" : "Optional"}</div><h3>${escape(item.question)}</h3>${context}${searchControl}${controls}<div class="question-editor-actions">${!unavailable ? `<button type="submit" class="button button-primary">Confirm &amp; remember answer ${icon("check")}</button>` : ""}<button type="button" class="text-button" data-action="refresh-questions" data-id="${escape(item.job_id)}">Refresh form choices</button>${unavailable ? externalLink(list(state.jobs).find(job => job.id === item.job_id)?.apply_url,"Open employer form") : ""}</div><p class="field-hint">Only confirming changes your saved answer. Review the updated approval before running; refreshing or searching never submits an application.</p></form>`;
+  }
   function renderActivityQuestions() {
     const pending = list(state.answer_memory?.pending);
     const saved = list(state.answer_memory?.saved);
-    const signature = JSON.stringify([pending,saved]);
+    const signature = JSON.stringify([pending,saved,[...questionSources]]);
     if (signature === lastInboxSignature) return;
     lastInboxSignature = signature;
-    $("#activity-question-count").textContent = pending.length;
     $("#nav-activity-questions").textContent = pending.length;
     $("#nav-activity-questions").hidden = !pending.length;
     const optionalOpen = $("#activity-question-list details")?.open === true;
-    const questionCard = item => {
-      const key = `${item.job_id}:${item.question}`;
-      const optionSignature = JSON.stringify([item.type,item.options]);
-      const storedDraft = questionDrafts.get(key);
-      const draft = storedDraft?.signature === optionSignature ? storedDraft.value : "";
-      const options = item.type === "checkbox" ? [{label:"Yes",value:"true"},{label:"No",value:"false"}] : list(item.options);
-      const multiple = /(?:mark|select|choose) all (?:that )?apply/i.test(item.question);
-      const unavailableChoice = ["select","radio"].includes(item.type) && (!options.length || multiple);
-      let controls;
-      if (unavailableChoice) controls = `<p class="question-unavailable">${multiple ? "This is a multiple-choice control the automatic worker cannot answer yet." : "The form did not expose supported choices for this control."} ${item.required ? "Open the employer form to review it manually." : "This question is optional and can be left blank."}</p>`;
-      else if (options.length && options.length <= 6) controls = `<fieldset class="question-options"><legend>Choose your answer</legend>${options.map((option,index) => `<label><input type="radio" name="choice" value="${index}" ${draft === String(index) ? "checked" : ""} required><span>${escape(option.label)}</span></label>`).join("")}</fieldset>`;
-      else if (options.length) controls = `<label class="field">Your answer<select name="choice" required><option value="">Choose an available answer</option>${options.map((option,index) => `<option value="${index}" ${draft === String(index) ? "selected" : ""}>${escape(option.label)}</option>`).join("")}</select></label>`;
-      else controls = `<label class="field">Your answer<textarea name="answer" rows="2" maxlength="4000" required placeholder="Enter an accurate answer to this question">${escape(draft)}</textarea></label>`;
-      return `<form class="activity-answer-form" data-job-id="${escape(item.job_id)}" data-question="${escape(item.question)}" data-options-signature="${escape(optionSignature)}"><div class="answer-context">${escape(item.company)} · ${escape(item.title)} · ${item.required ? "Required" : "Optional"}</div><h3>${escape(item.question)}</h3>${controls}<p class="field-hint">Saved for this exact question and shown in Rules. Review the updated approval before running again; confirming does not retry or submit the application.</p>${unavailableChoice ? externalLink(list(state.jobs).find(job => job.id === item.job_id)?.apply_url,"Open employer form") : `<button type="submit" class="button button-primary">Confirm &amp; remember answer ${icon("check")}</button>`}</form>`;
-    };
+    const openSaved = new Set($$("#rules-answer-list .saved-answer-editor[open]").map(node => node.querySelector("form")?.dataset.question));
     const required = pending.filter(item => item.required);
     const optional = pending.filter(item => !item.required);
     $("#activity-question-count").textContent = `${required.length} required · ${optional.length} optional`;
-    $("#activity-question-list").innerHTML = pending.length ? required.map(questionCard).join("") + (optional.length ? `<details class="optional-form-questions" ${optionalOpen ? "open" : ""}><summary>${optional.length} optional questions — you can leave these blank</summary>${optional.map(questionCard).join("")}</details>` : "") : '<p class="answer-empty">No unanswered application questions. New questions will appear here when a form needs your input.</p>';
-    $("#activity-saved-answer-list").innerHTML = `<details class="saved-answer-review"><summary>Confirmed answers (${saved.length})</summary>${saved.map((item,index) => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit</button></div>`).join("") || '<p class="answer-empty">No answers confirmed yet.</p>'}</details>`;
-    $("#rules-answer-list").innerHTML = saved.length ? saved.map(item => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div></div>`).join("") : '<p class="answer-empty">No confirmed answers yet. Answer employer questions in Activity as they appear.</p>';
+    $("#activity-question-list").innerHTML = pending.length ? required.map(item => questionCard(item)).join("") + (optional.length ? `<details class="optional-form-questions" ${optionalOpen ? "open" : ""}><summary>${optional.length} optional questions — you can leave these blank</summary>${optional.map(item => questionCard(item)).join("")}</details>` : "") : '<p class="answer-empty">No unanswered application questions. New questions appear when a form needs your input.</p>';
+    $("#activity-saved-answer-list").innerHTML = `<details class="saved-answer-review"><summary>Saved answers (${saved.length})</summary>${saved.map((item,index) => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Review choices</button></div>`).join("")}</details>`;
+    $("#rules-answer-list").innerHTML = saved.length ? saved.map((item,index) => {
+      const observed = answerContext(item);
+      return observed ? `<details class="saved-answer-editor" ${openSaved.has(item.question) ? "open" : ""}><summary>${escape(item.question)}<span>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</span></summary>${questionCard(observed,item)}</details>` : `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button></div>`;
+    }).join("") : '<p class="answer-empty">No confirmed answers yet. Answer employer questions in Activity as they appear.</p>';
   }
   function renderControls() {
     const approved = Boolean(state.approval?.approved);
@@ -546,6 +568,12 @@
     $("#memory-form-title").textContent = "Add a reusable answer";
   }
   function editAnswer(item, pending = false) {
+    const observed = pending ? item : answerContext(item);
+    if (observed && ["select","radio","checkbox"].includes(observed.type)) {
+      if (pending) { setView("activity"); const form = [...document.querySelectorAll("#activity-question-list .activity-answer-form")].find(form => form.dataset.jobId === observed.job_id && form.dataset.question === observed.question); if (form?.closest("details")) form.closest("details").open=true; form?.scrollIntoView({block:"center",behavior:"smooth"}); }
+      else { setView("rules"); const details = [...document.querySelectorAll("#rules-answer-list .saved-answer-editor")].find(node => node.querySelector("form")?.dataset.question === item.question); if (details) { details.open=true; details.scrollIntoView({block:"center",behavior:"smooth"}); } }
+      return;
+    }
     resetAnswerForm();
     setView("profile");
     const form = $("#answer-memory-form");
@@ -693,26 +721,34 @@
   document.addEventListener("input",event => {
     const form = event.target.closest(".activity-answer-form");
     if (!form) return;
+    if (event.target.name === "lookup_query") { questionSearches.set(`${form.dataset.jobId}:${form.dataset.question}`,event.target.value); return; }
     const value = form.elements.choice?.value ?? form.elements.answer?.value ?? "";
     questionDrafts.set(`${form.dataset.jobId}:${form.dataset.question}`,{value,signature:form.dataset.optionsSignature});
+  });
+  document.addEventListener("change",event => {
+    if (event.target.name !== "question_source") return;
+    questionSources.set(event.target.dataset.question,event.target.value);
+    lastInboxSignature="";
+    renderActivityQuestions();
   });
   document.addEventListener("submit",event => {
     const form = event.target.closest(".activity-answer-form");
     if (!form) return;
     event.preventDefault();
     if (dirty.profile) { showNotice("Save or discard your unsaved profile changes before confirming an application answer.",true); return; }
-    const item = list(state.answer_memory?.pending).find(candidate => candidate.job_id === form.dataset.jobId && candidate.question === form.dataset.question);
+    const item = recordedQuestion(form.dataset.jobId,form.dataset.question);
     if (!item) { showNotice("This question changed. Refresh Activity before confirming an answer.",true); return; }
     if (form.dataset.optionsSignature !== JSON.stringify([item.type,item.options])) { showNotice("The available choices changed. Review them and choose your answer again.",true); return; }
-    let answer;
+    let answer, choiceLabel;
     if (form.elements.choice) {
       const selected = Number(form.elements.choice.value);
       const options = item.type === "checkbox" ? [{value:true},{value:false}] : list(item.options);
       if (form.elements.choice.value === "" || !Number.isInteger(selected) || !options[selected]) return;
       answer = options[selected].value;
+      if (["select","radio"].includes(item.type)) choiceLabel = options[selected].label;
     } else answer = form.elements.answer.value.trim();
     action(`question-${item.job_id}-${item.id || item.question}`,form.querySelector('button[type="submit"]'),async () => {
-      const result = await post("/api/answers",{question:item.question,answer,job_id:item.job_id});
+      const result = await post("/api/answers",{question:item.question,answer,job_id:item.job_id,...(choiceLabel === undefined ? {} : {choice_label:choiceLabel})});
       questionDrafts.delete(`${item.job_id}:${item.question}`);
       return result;
     },"Answer confirmed and remembered for this exact question. It is now shown in Rules → Saved application answers. Review and approve the updated details before running again.");
@@ -728,13 +764,22 @@
       openQueueReview();
     } else if (name === "queue-matching") {
       action("queue-matching",button,async () => { const result = await post("/api/queue/matching"); filter = "queued"; search = ""; $("#job-search").value = ""; updateFilters(); return result; },result => result.message);
+    } else if (name === "refresh-questions") {
+      const form = button.closest(".activity-answer-form");
+      action(`questions-${id}`,button,() => form ? post(`/api/jobs/${encodeURIComponent(id)}/questions/options`,{question:form.dataset.question,query:""}) : post(`/api/jobs/${encodeURIComponent(id)}/questions/refresh`),result => result.message);
+    } else if (name === "search-choices") {
+      const form = button.closest(".activity-answer-form");
+      const query = form?.elements.lookup_query?.value.trim();
+      if (!query) { showNotice("Enter a search term first.",true); return; }
+      action(`questions-${form.dataset.jobId}`,button,() => post(`/api/jobs/${encodeURIComponent(form.dataset.jobId)}/questions/options`,{question:form.dataset.question,query}),result => result.message);
     } else if (name === "stop-run") {
       action("stop-run",button,() => post("/api/run/stop"),"Stop requested before the next submission. Scheduling is off; an already sent application cannot be undone.");
     } else if (name === "refresh-worker") {
       action("refresh-worker",button,() => refresh(true));
     } else if (name === "open-questions") {
       setView("activity");
-      const form = id ? [...document.querySelectorAll(".activity-answer-form")].find(item => item.dataset.jobId === id) : null;
+      const form = id ? [...document.querySelectorAll("#activity-question-list .activity-answer-form")].find(item => item.dataset.jobId === id) : null;
+      if (form?.closest("details")) form.closest("details").open=true;
       (form || $("#activity-questions")).scrollIntoView({block:"start",behavior:"smooth"});
     } else if (name === "open-memory") {
       setView("profile");

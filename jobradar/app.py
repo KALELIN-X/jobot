@@ -20,7 +20,7 @@ from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .destinations import SUPPORTED_HOSTS, verified_destination
 from .dashboard import application_events
-from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules, company_scope
+from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, QuestionLookupRequest, Rules, company_scope
 from .job_facts import job_facts
 from .store import Store, application_key, now
 from .run_status import RunTracker
@@ -45,6 +45,7 @@ def create_app(data_dir: Path | None = None):
     tracker = RunTracker(store)
     state = {"running": False, "fetching": False, "task": None, "demo_running": False, "mock_tokens": set()}
     queue_lock = asyncio.Lock()
+    question_lock = asyncio.Lock()
 
     def configuration():
         rules = Rules.model_validate(store.get("rules", {})).model_dump()
@@ -242,7 +243,8 @@ def create_app(data_dir: Path | None = None):
             state["fetching"] = False
 
     async def run_queue():
-        from .autofill import run_application
+        from .answer_memory import _recorded_candidates
+        from .autofill import _label, run_application
         from .ranking import rank_job
         from .refresh import refresh_candidate
         if queue_lock.locked():
@@ -357,7 +359,19 @@ def create_app(data_dir: Path | None = None):
                     result_status = result.get("status", "needs_attention")
                     if result_status not in {"submitted", "needs_attention", "uncertain", "failed"}:
                         result_status = "needs_attention"
-                    store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None, pending_questions=result.get("pending_questions", []), screenshot=result.get("screenshot"))
+                    pending_questions = result.get("pending_questions", [])
+                    latest = store.job(job["id"])
+                    observed = latest.get("form_questions", latest.get("pending_questions", [])) or []
+                    changed = {_label(item.get("question")) for item in pending_questions}
+                    # Actual worker observations supersede an earlier inspection.
+                    # Pending questions are a partial snapshot without stable
+                    # control IDs: preserve existing ambiguous controls rather
+                    # than guessing which same-label control was replaced.
+                    conflicting = {question for question in changed if len(_recorded_candidates(latest, question)) > 1}
+                    observed = [item for item in observed if _label(item.get("question")) not in changed
+                                or _label(item.get("question")) in conflicting] + pending_questions
+                    store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None, pending_questions=pending_questions, form_questions=observed,
+                                     **({"questions_refreshed_at": now()} if pending_questions else {}), screenshot=result.get("screenshot"))
                     tracker.report({"stage": "finished" if result_status == "submitted" else result_status,
                                     "pending_question_count": len(result.get("pending_questions", []))}, job)
                     tracker.outcome(job, {"status": result_status})
@@ -509,6 +523,65 @@ def create_app(data_dir: Path | None = None):
         if target is None:
             raise HTTPException(404, "No recorded browser capture is available for this application.")
         return FileResponse(target, media_type="image/png")
+
+    async def refresh_form_questions(job_id, *, question=None, query=None):
+        from .autofill import _label, plan_form
+        from .question_lookup import inspect_questions
+
+        job = store.job(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found.")
+        if (job.get("demo") or job.get("attempted_at") or store.destination_attempted(job)
+                or job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"}):
+            raise HTTPException(409, "Only an unattempted application can refresh its form questions.")
+        if not verified_destination(job) or job.get("closed") is True:
+            raise HTTPException(409, "Refresh this job's verified employer link before reading its form questions.")
+        if worker_busy() or state["fetching"] or question_lock.locked():
+            raise HTTPException(409, "Wait for the current application, fetch, or question lookup to finish.")
+        async with question_lock:
+            inspected = await inspect_questions(job, question=question, query=query or None)
+            if inspected.get("status") != "inspected":
+                raise HTTPException(422, inspected.get("message") or "The employer's current choices could not be read.")
+            fresh = store.job(job_id)
+            if (fresh is None or fresh.get("apply_url") != job.get("apply_url") or fresh.get("attempted_at")
+                    or worker_busy() or state["fetching"] or store.destination_attempted(fresh)
+                    or fresh.get("closed") is True or not verified_destination(fresh)
+                    or fresh["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"}):
+                raise HTTPException(409, "The application changed during inspection. Refresh its status before trying again.")
+            fields = inspected.get("fields") or []
+            public_questions = plan_form(fields, {}, None).pending_questions
+            profile = configuration()[0]
+            pending = plan_form(fields, profile, None).pending_questions
+            if question is not None:
+                expected = _label(question)
+                selected = [item for item in public_questions if item["question"] == expected]
+                if len(selected) != 1:
+                    raise HTTPException(422, "The current form did not expose one reusable control for this question.")
+                # A targeted lookup refreshes only that question: unrelated
+                # dropdowns have not been opened and must keep their choices.
+                public_questions = [item for item in fresh.get("form_questions", fresh.get("pending_questions", []))
+                                    if item.get("question") != expected] + selected
+                pending = [item for item in fresh.get("pending_questions", []) if item.get("question") != expected] + [
+                    item for item in pending if item["question"] == expected]
+            store.update_job(job_id, fresh["status"], form_questions=public_questions, pending_questions=pending,
+                             questions_refreshed_at=now())
+            store.event("questions", "Current employer questions were read without filling or submitting an application.", job_id)
+            if question is not None:
+                selected = next(item for item in public_questions if item["question"] == _label(question))
+                return {"question": selected["question"], "options": selected.get("options", []),
+                        "searchable": selected.get("searchable", False), "lookup_required": selected.get("lookup_required", False),
+                        "message": "Choose a returned employer option, then confirm it." if selected.get("options") else
+                                   "No choices returned. Try a more specific search or refresh the form questions."}
+            return {"questions": len(public_questions), "pending": len(pending),
+                    "message": "Employer questions and choices refreshed. No answers were changed and no application was submitted."}
+
+    @app.post("/api/jobs/{job_id}/questions/refresh")
+    async def refresh_questions(job_id: str):
+        return await refresh_form_questions(job_id)
+
+    @app.post("/api/jobs/{job_id}/questions/options")
+    async def lookup_question(job_id: str, body: QuestionLookupRequest):
+        return await refresh_form_questions(job_id, question=body.question, query=body.query)
 
     @app.post("/api/profile")
     async def save_profile(profile: Profile):

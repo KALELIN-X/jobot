@@ -204,10 +204,36 @@ class GreenhouseTransport:
             self.upload_active = False
 
 
+_COMBO_HELPERS_JS = r"""
+  const comboRoot = input => input.closest('.select__container,[class*="select-container"],.react-select') || input.closest('.form-field,.field-wrapper') || input.parentElement?.parentElement;
+  const queryMinimum = value => {
+    const match = value.match(/(?:at least|minimum(?: of)?|min\.?)[^\d]{0,15}([1-9]\d?)\s*(?:characters?|letters?)|(?:type|enter)\s+([1-9]\d?)\s+(?:or more\s+)?(?:characters?|letters?)/i);
+    return match ? Number(match[1] || match[2]) : null;
+  };
+  const comboMetadata = input => {
+    const root = comboRoot(input);
+    const owned = ((input.getAttribute('aria-controls') || '') + ' ' + (input.getAttribute('aria-owns') || '')).split(/\s+/).filter(Boolean).map(id => document.getElementById(id)).filter(Boolean);
+    const multiple = !!(input.multiple || input.getAttribute('aria-multiselectable') === 'true' || root?.getAttribute('aria-multiselectable') === 'true'
+      || input.closest('.select__value-container--is-multi,.react-select__value-container--is-multi,.select--is-multi,.react-select--is-multi')
+      || owned.some(node => node.getAttribute('aria-multiselectable') === 'true' || node.querySelector('[role="listbox"][aria-multiselectable="true"]')));
+    const single = !multiple;
+    const recognized = /^(?:list|both)$/.test(input.getAttribute('aria-autocomplete') || '') || !!root?.matches('.select__container,[class*="select-container"],.react-select');
+    const searchable = single && recognized && input.getAttribute('role') === 'combobox' && input.tagName === 'INPUT' && /^(?:text|search)$/.test(input.type || 'text') && !input.readOnly && !input.disabled && input.getAttribute('aria-disabled') !== 'true' && input.getAttribute('aria-autocomplete') !== 'none';
+    const described = (input.getAttribute('aria-describedby') || '').split(/\s+/).map(id => text(document.getElementById(id))).join(' ');
+    const hint = [described, input.getAttribute('placeholder') || '', text(root)].join(' ');
+    const minimum = queryMinimum(hint);
+    return {multiple, searchable, lookup_required:searchable, ...(minimum === null ? {} : {minimum_query_length:minimum})};
+  };
+"""
+
+COMBOBOX_TIMEOUT_MS = 3000
+
+
 SNAPSHOT_JS = r"""(token) => {
   const visible = el => !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none' && getComputedStyle(el).opacity !== '0');
   const text = el => el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '';
   const labelled = el => (el?.getAttribute('aria-labelledby') || '').split(/\s+/).map(id => text(document.getElementById(id))).filter(Boolean).join(' ');
+  __COMBO_HELPERS__
   const all = Array.from(document.querySelectorAll('input,select,textarea,[role="combobox"]')).filter((el,i,items) => items.indexOf(el) === i);
   // Greenhouse/React-select uses an aria-hidden required proxy next to its
   // visible combobox. Do not answer that proxy; native checkValidity must still
@@ -222,22 +248,24 @@ SNAPSHOT_JS = r"""(token) => {
     const question = box && box.querySelector('legend,.application-label,.application-question-label,.field-label');
     const groupLabel = labelled(group) || text(group?.querySelector('legend'));
     const isCombo = el.getAttribute('role') === 'combobox';
-    const comboRoot = isCombo ? el.closest('.select__container,[class*="select-container"],.react-select,.form-field,.field-wrapper') || el.parentElement?.parentElement : null;
-    const selected = comboRoot?.querySelector('.select__single-value,[class*="singleValue"],[data-selected-value]');
+    const root = isCombo ? comboRoot(el) : null;
+    const metadata = isCombo ? comboMetadata(el) : null;
+    const selected = root?.querySelector('.select__single-value,[class*="singleValue"],[data-selected-value]');
     const label = el.type === 'file' ? (groupLabel || associated || labelled(el) || el.id) :
       el.type === 'radio' ? (groupLabel || text(question) || labelled(el) || el.getAttribute('aria-label') || associated) :
       (associated || labelled(el) || el.getAttribute('aria-label') || text(question));
     return {id: token + '-' + i, name: el.name || el.id || '', label: label || '',
       option_label: associated, type: isCombo ? 'select' : el.type || el.tagName.toLowerCase(), tag: el.tagName.toLowerCase(),
-      combobox: isCombo, selected_label: isCombo ? text(selected) : '',
+      combobox: isCombo, selected_label: isCombo && selected && visible(selected) ? text(selected) : '',
+      ...(metadata || {searchable:false, lookup_required:false}),
       required: !!(el.required || el.getAttribute('aria-required') === 'true' ||
         /[*✱∗]\s*$|\(required\)\s*$/i.test(label || '') ||
         (el.type === 'file' && group?.getAttribute('aria-required') === 'true') ||
         (box && (box.classList.contains('required') || !!box.querySelector('.required')))),
       disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'), visible: visible(el),
       value: el.value || '', checked: !!el.checked, has_file: !!(el.files && el.files.length),
-      multiple: !!(el.multiple || el.getAttribute('aria-multiselectable') === 'true'),
-      options: el.options ? Array.from(el.options).slice(0,300).map(o => ({value: o.value, label: text(o), disabled: o.disabled})) : []};
+      multiple: isCombo ? metadata.multiple : !!(el.multiple || el.getAttribute('aria-multiselectable') === 'true'),
+      options: el.options ? Array.from(el.options).slice(0,300).map(o => ({value: o.value, label: text(o), disabled: !!(o.disabled || o.closest('optgroup')?.disabled)})) : []};
   });
   const forms = Array.from(document.forms).filter(visible).map(f => ({
     action: f.action || location.href, method: (f.method || 'get').toLowerCase(),
@@ -255,51 +283,130 @@ SNAPSHOT_JS = r"""(token) => {
     captcha: !!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],iframe[title*="CAPTCHA"],iframe[title*="captcha"],.g-recaptcha,.h-captcha,[data-sitekey]'),
     login: controls.some(el => el.type === 'password' && visible(el)) || Array.from(document.querySelectorAll('h1,h2')).some(el => visible(el) && /^(?:log in|login|sign in)(?: to .*)?$/i.test(text(el))),
     body: document.body ? document.body.innerText : ''};
-}"""
+}""".replace("__COMBO_HELPERS__", _COMBO_HELPERS_JS)
 
 
 CHOICES_JS = r"""({fieldId, token}) => {
   const input = document.querySelector('[data-jobradar-field="' + fieldId + '"]');
   if (!input) return {options:[], supported:false};
-  const visible = el => !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none');
-  const ids = (input.getAttribute('aria-controls') || input.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
-  const linked = ids.map(id => document.getElementById(id)).filter(el => el && visible(el) && el.getAttribute('role') === 'listbox');
-  const boxes = linked.length ? linked : Array.from(document.querySelectorAll('[role="listbox"]')).filter(visible);
-  if (boxes.length !== 1 || boxes[0].getAttribute('aria-multiselectable') === 'true') return {options:[], supported:false};
+  const visible = el => !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none' && getComputedStyle(el).opacity !== '0');
+  const text = el => el ? (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  __COMBO_HELPERS__
+  const metadata = comboMetadata(input), root = comboRoot(input);
+  const ids = [...new Set(((input.getAttribute('aria-controls') || '') + ' ' + (input.getAttribute('aria-owns') || '')).split(/\s+/).filter(Boolean))];
+  const linked = ids.flatMap(id => {
+    const node = document.getElementById(id);
+    return node ? (node.getAttribute('role') === 'listbox' ? [node] : Array.from(node.querySelectorAll('[role="listbox"]'))) : [];
+  });
+  const labels = new Set([input.id, ...(input.getAttribute('aria-labelledby') || '').split(/\s+/)].filter(Boolean));
+  // Declared ARIA ownership is authoritative even while a portal is replaced.
+  // A different open dropdown must never supply this control's answer choices.
+  const fallback = ids.length ? [] : Array.from(document.querySelectorAll('[role="listbox"]')).filter(box => root?.contains(box) || (box.getAttribute('aria-labelledby') || '').split(/\s+/).some(id => labels.has(id)));
+  const boxes = [...new Set(ids.length ? linked : fallback)].filter(visible);
+  if (boxes.some(box => box.getAttribute('aria-multiselectable') === 'true')) {
+    metadata.multiple = true;
+    metadata.searchable = false;
+    metadata.lookup_required = false;
+  }
+  const hint = [text(root), ...boxes.map(text)].join(' ');
+  const minimum = queryMinimum(hint);
+  if (minimum !== null) metadata.minimum_query_length = minimum;
+  const loading = [input, root, ...boxes].some(el => el?.getAttribute('aria-busy') === 'true') || boxes.some(box => /^(?:loading|searching)(?:\.{0,3}|…)?$/i.test(text(box)));
+  const query_hint = /start\s+typing|type\s+(?:at least|to search)|enter\s+\d+\s+(?:or more\s+)?characters/i.test(hint) || minimum !== null;
+  const no_results = boxes.some(box => /^(?:no (?:options|results|matches)(?: (?:found|available))?)[.!]?$/i.test(text(box)));
+  const base = {...metadata, loading, query_hint, no_results};
+  if (boxes.length !== 1 || metadata.multiple) return {...base, options:[], supported:false};
   const choices = Array.from(boxes[0].querySelectorAll('[role="option"]')).filter(visible);
-  if (choices.length > 300) return {options:[], supported:false};
-  return {supported:true, options:choices.map((el,i) => {
+  if (choices.length > 300) return {...base, options:[], supported:false};
+  const options = choices.map((el,i) => {
     const label = (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
     const id = token + '-' + i;
     el.setAttribute('data-jobradar-choice',id);
-    return {id, label, value:label, disabled:el.getAttribute('aria-disabled') === 'true'};
-  })};
+    return {id, label, value:label, disabled:!!(el.disabled || el.closest('[aria-disabled="true"]'))};
+  });
+  return {...base, supported:true, lookup_required:metadata.searchable && !options.some(option => option.label && !option.disabled), options};
+}""".replace("__COMBO_HELPERS__", _COMBO_HELPERS_JS)
+
+
+COMMITTED_CHOICE_JS = r"""({fieldId, label}) => {
+  const input = document.querySelector('[data-jobradar-field="' + fieldId + '"]');
+  if (!input || input.getAttribute('aria-expanded') === 'true') return false;
+  const root = input.closest('.select__container,[class*="select-container"],.react-select') || input.closest('.form-field,.field-wrapper') || input.parentElement?.parentElement;
+  const selected = root?.querySelector('.select__single-value,[class*="singleValue"],[data-selected-value]');
+  if (!selected || !selected.getClientRects().length) return false;
+  const style = getComputedStyle(selected);
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && (selected.innerText || selected.textContent || '').replace(/\s+/g,' ').trim() === label;
 }"""
 
 
 async def read_combobox(page, field: dict, *, close: bool = True, query: str | None = None) -> dict:
-    """Read one visible, associated listbox without typing or guessing a value."""
+    """Read the current owned choices, optionally using an explicit search query."""
     control = page.locator(f'[data-jobradar-field="{field["id"]}"]')
-    original = await control.input_value() if await control.evaluate("el => 'value' in el") else None
+    original = None
     searched = False
-    await control.click(timeout=5000)
+    result = {"options": [], "supported": False, "searchable": False, "lookup_required": False, "multiple": field.get("multiple") is True}
     try:
-        if isinstance(query, str) and query and len(query) <= 240:
+        original = await control.input_value() if await control.evaluate("el => 'value' in el") else None
+        await control.click(timeout=5000)
+        result = await page.evaluate(CHOICES_JS, {"fieldId": field["id"], "token": uuid.uuid4().hex})
+        exact = lambda value: any(option["label"] == query and not option["disabled"] for option in value["options"])
+        initial_choices = [(option["label"], option["disabled"]) for option in result["options"]]
+        initial_no_results = result.get("no_results", False)
+        if isinstance(query, str) and query.strip() and len(query) <= 240 and result.get("searchable") and not exact(result):
             # Search using only the explicit supplied answer. Selecting a result
             # still requires one exact visible choice; typing never commits it.
-            first = await page.evaluate(CHOICES_JS, {"fieldId": field["id"], "token": uuid.uuid4().hex})
-            if not first["options"]:
-                await control.fill(query, timeout=3000)
-                searched = True
-        await page.locator('[role="listbox"]:visible [role="option"]').first.wait_for(state="visible", timeout=3000)
-        return await page.evaluate(CHOICES_JS, {"fieldId": field["id"], "token": uuid.uuid4().hex})
+            if len(query.strip()) < result.get("minimum_query_length", 0):
+                return result
+            await control.fill(query, timeout=3000)
+            searched = True
+            if await control.get_attribute("aria-expanded") == "false":
+                # Some hosted async controls accept text while keeping their
+                # menu closed. ArrowDown opens it without committing a choice.
+                await control.press("ArrowDown", timeout=3000)
+        deadline = asyncio.get_running_loop().time() + COMBOBOX_TIMEOUT_MS / 1000
+        previous = None
+        stable_since = asyncio.get_running_loop().time()
+        saw_loading = False
+        reopened, last_reopened = 0, stable_since
+        while True:
+            result = await page.evaluate(CHOICES_JS, {"fieldId": field["id"], "token": uuid.uuid4().hex})
+            current = [(option["label"], option["disabled"]) for option in result["options"]]
+            signature = (current, result.get("loading"), result.get("no_results"))
+            moment = asyncio.get_running_loop().time()
+            if signature != previous:
+                previous, stable_since = signature, moment
+            saw_loading = saw_loading or result.get("loading", False)
+            if result.get("multiple") and not result.get("loading"):
+                return result
+            if (not result.get("supported") and not result.get("loading") and not result.get("multiple") and reopened < 4
+                    and moment - last_reopened >= 0.25 * (reopened + 1)
+                    and await control.get_attribute("aria-expanded") == "false"):
+                await control.press("ArrowDown", timeout=3000)
+                reopened, last_reopened = reopened + 1, moment
+                continue
+            if not result.get("loading"):
+                if result["supported"] and result["options"] and (not searched or exact(result)):
+                    return result
+                if not searched and result.get("searchable") and result.get("query_hint"):
+                    return result
+                if searched and moment - stable_since >= 0.15 and (bool(current) and current != initial_choices
+                        or saw_loading or result.get("no_results") and not initial_no_results):
+                    return result
+            if moment >= deadline:
+                if result.get("loading"):
+                    return {**result, "options": [], "supported": False, "lookup_required": bool(result.get("searchable"))}
+                return result
+            await asyncio.sleep(0.075)
     except Exception:
-        return {"options": [], "supported": False}
+        return {**result, "options": [], "supported": False}
     finally:
         if close:
-            if searched and original is not None:
-                await control.fill(original, timeout=3000)
-            await control.press("Escape", timeout=3000)
+            try:
+                if searched and original is not None:
+                    await control.fill(original, timeout=3000)
+                await control.press("Escape", timeout=3000)
+            except Exception:
+                pass
 
 
 async def enrich_comboboxes(page, snapshot: dict, answer_for=None) -> dict:
@@ -311,6 +418,9 @@ async def enrich_comboboxes(page, snapshot: dict, answer_for=None) -> dict:
         result = await read_combobox(page, item, query=answer if isinstance(answer, str) else None)
         item["options"] = [{key: value for key, value in option.items() if key != "id"} for option in result["options"]]
         item["unsupported_choices"] = not result["supported"]
+        for key in ("searchable", "lookup_required", "minimum_query_length", "multiple"):
+            if key in result:
+                item[key] = result[key]
     return snapshot
 
 
@@ -318,6 +428,10 @@ async def choose_combobox(page, field_id: str, label: str) -> None:
     """Commit exactly one actual DOM option; text in the search box is not enough."""
     result = await read_combobox(page, {"id": field_id}, close=False, query=label)
     options = [item for item in result["options"] if item["label"] == label and not item["disabled"]]
-    if not result["supported"] or len(options) != 1:
+    if not result["supported"] or result.get("loading") or len(options) != 1:
         raise ValueError("The exact approved combobox option is no longer available.")
     await page.locator(f'[data-jobradar-choice="{options[0]["id"]}"]').click(timeout=5000)
+    try:
+        await page.wait_for_function(COMMITTED_CHOICE_JS, arg={"fieldId": field_id, "label": label}, timeout=COMBOBOX_TIMEOUT_MS)
+    except Exception as error:
+        raise ValueError("The dropdown did not commit the exact approved option.") from error

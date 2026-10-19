@@ -60,13 +60,21 @@ Supported forms record unfamiliar ordinary questions in the **Activity** questio
 
 In the inbox, answer the actual recorded question: choose one of the form's recorded radio/select options, or enter a written answer for a text question. **Confirm & remember** explicitly saves the answer through the same local answer-memory workflow. You can also use **Answer & remember** in the profile, or add, edit, and forget an exact question/answer directly. Confirm that an answer is accurate and suitable for reuse beyond that employer before saving it.
 
+For searchable dropdowns such as **Location (City)**, type a search and click **Search choices**, then select an actual returned option and confirm it. An empty city list is not a free-text field. The read-only lookup opens a fresh public form without your profile, resume, or browser session; it types only the explicit search query and never selects or submits. Searching alone does not change your saved answer or authorize an application. A saved text lookup query remains provisional until an exact live option can be matched; a failed query stays pending rather than repeatedly pretending it was answered.
+
+Use **Refresh form questions** in a role's details, or **Refresh form choices** beside a question, to replace stale question metadata even while application approval is missing. This does not run or requeue the application. Login, verification, inaccessible forms, or changed destinations return a visible error and preserve the previous questions. Already attempted applications cannot be refreshed through this tool.
+
 Saved answers live in `Profile.answers`, survive restarts, and appear under **Application rules → Saved application answers** and in the approval review. They are reused only for the same exact visible question, with whitespace normalized, never by fuzzy or semantic matching. Choice controls must have one exact matching option; a changed choice list needs review. Boolean answers preserve explicit Yes/No values.
+
+Expand a saved answer in **Application rules** to review its observed controls and choices. When multiple employers asked that question, choose the application context: their option lists remain separate. These lists are bounded snapshots, not a promise that a future form will offer the same choices. The worker reloads the real menu, matches one enabled exact option, and verifies that it was selected. Optional unsupported multiselect questions can remain blank; required multiselects still need manual review.
 
 Saving or changing an answer revokes application approval and turns scheduling off. Review and approve the updated configuration, then explicitly add the paused role back to the queue if it has no prior attempt. Saving an answer never adds a role to the queue, resumes a form, or retries a submission by itself. Duplicate and uncertain-attempt protections still apply. Keep company-specific answers manual; this library cannot infer whether identical wording has a different meaning at another employer. Legal agreements, credentials, CAPTCHAs, and verification challenges are not reusable answers.
 
 Search preferences and saved answers serve different purposes. Preferences decide which jobs match, including location, experience, company scope, and daily limits. Saved application answers supply facts or wording you confirmed for recurring employer questions. Changing a preference does not invent an answer, and remembering an answer does not relax a job filter. Normal editing uses the visible controls; JSON is optional advanced editing.
 
 This is explicit answer memory, not model training. Jobot cannot observe answers entered in unrelated browser sessions or learn from unsupported application sites.
+
+Dropdown verification on October 18, 2026 read six public employer forms without candidate details, uploads, or submissions: CLEAR and ID.me returned city search choices; SirenOpt returned phone-country choices. Shield AI, SteerBridge, and WeRide Lever forms stopped at verification checks. These are point-in-time read-only checks, not proof of successful unattended applications. Browser regression tests separately cover async menus, native controls, exact selection, local fixture submissions, answer confirmation, and failure handling. Blocked worker transport messages identify only the method, host, and stage, without request paths, queries, or personal values.
 
 ### Applications you already submitted elsewhere
 
@@ -157,7 +165,7 @@ try {
 }
 ```
 
-If Node.js is available, run the dashboard's pure filter-helper checks with `node --test tests/dashboard_helpers.test.cjs`. Node is not required to run the app.
+If Node.js is available, run the dashboard filter and answer-editor checks with `node --test tests/dashboard_helpers.test.cjs tests/dropdown_ui.test.cjs`. Node is not required to run the app.
 
 The unique test directories avoid reusing a locked Windows temporary folder. Unit and API tests use synthetic fixtures and mocked HTTP/browser boundaries. `tests/test_greenhouse_forms.py` runs actual Chromium against local synthetic Greenhouse-shaped forms, covering ordinary uploads, visible custom choices, and submission blockers; install the browser with the setup command first. These automated tests send no candidate data to employers. Tests also cover explicit queue selection/removal, safe bulk selection, approved scheduled selection, observable stages and stop requests, capture-path boundaries, public-source bounds, posting identity, historical duplicate protection, US filtering, graduation-month handling, unknown experience, exact answers, legal blockers, approval revocation, optional daily caps, and interrupted-run recovery. No external dataset or accuracy evaluation is claimed.
 

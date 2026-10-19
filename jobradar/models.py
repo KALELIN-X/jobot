@@ -23,6 +23,18 @@ class JobStatusRequest(StrictModel):
     status: Literal["new", "queued", "dismissed"]
 
 
+class QuestionLookupRequest(StrictModel):
+    question: str = Field(min_length=1, max_length=500)
+    query: str = Field(default="", max_length=240)
+
+    @field_validator("question", "query")
+    @classmethod
+    def check_lookup_text(cls, value):
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("Use ordinary question/search text without control characters.")
+        return value.strip()
+
+
 class ExternalApplicationRequest(StrictModel):
     url: str | None = Field(default=None, min_length=1, max_length=2000)
     job_id: str | None = Field(default=None, min_length=1, max_length=200)

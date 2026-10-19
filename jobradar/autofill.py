@@ -54,6 +54,19 @@ class URLNotApproved(ValueError):
     """The URL is outside the narrowly supported application boundary."""
 
 
+def _blocked_request_info(method: str, url: str, phase: str) -> dict[str, str]:
+    """Keep transport diagnostics useful without retaining a URL or body."""
+    try:
+        host = urlsplit(url).hostname or "unknown-host"
+    except (TypeError, ValueError):
+        host = "unknown-host"
+    if not re.fullmatch(r"[a-z0-9.-]{1,253}|[a-f0-9:]{2,45}", host):
+        host = "unknown-host"
+    method = method if method in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"} else "OTHER"
+    phase = phase if phase in {"opening_form", "inspecting_form", "filling_fields", "uploading_resume", "checking_answers", "submitting", "awaiting_confirmation"} else "unknown"
+    return {"method": method, "host": host, "phase": phase}
+
+
 def _url_parts(url: str):
     if not isinstance(url, str) or not url or any(c.isspace() for c in url):
         raise URLNotApproved("Application URL is invalid.")
@@ -171,14 +184,25 @@ def reusable_question(question: str) -> bool:
     return bool(question and len(question) <= 500 and not _LEGAL.search(question) and not _PRIVATE_CHALLENGE.search(question))
 
 
-def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[dict] | None = None) -> None:
+def searchable_lookup(item: dict) -> bool:
+    """A proven single-choice lookup with no usable choices, never a guessed one."""
+    return (item.get("type") == "select" and item.get("searchable") is True
+            and item.get("lookup_required") is True and not item.get("multiple")
+            and not any(isinstance(option, dict) and not option.get("disabled") and option.get("label") and option.get("value")
+                        for option in item.get("options") or []))
+
+
+def lookup_query_hash(value: str) -> str:
+    """Remember an ineffective query without copying personal text into metadata."""
+    return hashlib.sha256(re.sub(r"\s+", " ", value).strip().encode("utf-8")).hexdigest()
+
+
+def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[dict] | None = None, lookup_query: str | None = None) -> None:
     # Keep the visible question and choices, never the site's prefilled value.
     # A machine input name alone is not a question that the user can review.
     question = _label(item.get("label"))
     kind = "select" if item.get("tag") == "select" else str(item.get("type", "text")).lower()
     if not reusable_question(question) or kind not in {"text", "email", "tel", "url", "number", "date", "month", "search", "textarea", "select", "checkbox", "radio"}:
-        return
-    if any(candidate["question"] == question for candidate in plan.pending_questions):
         return
     choices = []
     for option in options if options is not None else item.get("options", []):
@@ -189,11 +213,25 @@ def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[
         if {"label": label, "value": value} not in choices:
             choices.append({"label": label, "value": value})
     if len(plan.pending_questions) < 60:
-        plan.pending_questions.append({
-            "id": hashlib.sha256(question.encode("utf-8")).hexdigest()[:20],
+        candidate = {
             "key": question, "question": question, "type": kind,
             "required": bool(item.get("required")), "options": choices[:300], "reason": reason,
-        })
+        }
+        if item.get("combobox") and item.get("searchable") is True and not item.get("multiple"):
+            candidate.update(searchable=True, lookup_required=searchable_lookup(item))
+            minimum = item.get("minimum_query_length")
+            if type(minimum) is int and 1 <= minimum <= 240:
+                candidate["minimum_query_length"] = minimum
+            if searchable_lookup(item) and isinstance(lookup_query, str) and lookup_query.strip():
+                candidate["lookup_query_hash"] = lookup_query_hash(lookup_query)
+        # Repeated scans of the same question can be collapsed, but two
+        # distinct controls with the same label must remain visibly ambiguous.
+        signature_keys = ("question", "type", "required", "options", "searchable", "lookup_required", "minimum_query_length")
+        signature = {key: candidate.get(key) for key in signature_keys}
+        if any(all(previous.get(key) == value for key, value in signature.items()) for previous in plan.pending_questions):
+            return
+        candidate["id"] = hashlib.sha256(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        plan.pending_questions.append(candidate)
 
 
 def _answer(item: dict, profile: dict) -> Any:
@@ -325,7 +363,8 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             plan.blockers.append(f"A verification, account, or private-data field requires human review: {description[:160]}")
             continue
         if item.get("multiple"):
-            plan.blockers.append(f"A multiple-selection field requires human review: {description[:160]}")
+            if required:
+                plan.blockers.append(f"A multiple-selection field requires human review: {description[:160]}")
             continue
         if kind == "radio":
             radios.setdefault(str(item.get("name") or label), []).append(item)
@@ -340,7 +379,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             continue
         answer = _answer(item, profile)
         if answer is None or answer == "" or isinstance(answer, (dict, list, tuple, set)):
-            _pending_question(plan, item, reason="missing_answer")
+            _pending_question(plan, item, reason="lookup_query_required" if searchable_lookup(item) else "missing_answer")
             if required:
                 plan.blockers.append(f"No explicit approved answer for required field: {description[:160]}")
             continue
@@ -356,7 +395,8 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         elif item.get("tag") == "select" or kind == "select":
             option = _option_match(item.get("options", []), answer) or _phone_country_option(item, answer, profile)
             if option is None or str(option.get("value", "")) == "":
-                _pending_question(plan, item, reason="choice_unavailable")
+                _pending_question(plan, item, reason="lookup_no_exact_choice" if searchable_lookup(item) else "choice_unavailable",
+                                  lookup_query=answer if isinstance(answer, str) else None)
                 plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
             elif item.get("combobox"):
                 if _label(item.get("selected_label")) != _label(option["label"]):
@@ -474,9 +514,23 @@ async def run_application(
     page = None
     loaded_document = False
     pending_questions: list[dict] = []
-    blocked_requests: list[str] = []
+    blocked_requests: list[dict[str, str]] = []
     submission_responses: list[int] = []
     final_request_count = 0
+    workflow_phase = "opening_form"
+
+    async def emit_progress(stage: str, **details):
+        nonlocal workflow_phase
+        workflow_phase = stage
+        await progress.emit(stage, **details)
+
+    def record_blocked_request(request):
+        phase = ("uploading_resume" if transport.upload_active else
+                 "awaiting_confirmation" if final_request_count else
+                 "submitting" if clicked else workflow_phase)
+        diagnostic = _blocked_request_info(request.method, request.url, phase)
+        if diagnostic not in blocked_requests and len(blocked_requests) < 10:
+            blocked_requests.append(diagnostic)
 
     async def result(status: str, message: str, *, terminal: bool = True, **extra) -> dict:
         nonlocal screenshot
@@ -488,6 +542,10 @@ async def run_application(
                 screenshot = str(path.resolve())
             except Exception:
                 pass
+        if blocked_requests:
+            summary = "; ".join(f"{item['method']} to {item['host']} during {item['phase'].replace('_', ' ')}" for item in blocked_requests[:3])
+            message += " Blocked request(s): " + summary + "."
+            extra["blocked_requests"] = [dict(item) for item in blocked_requests]
         payload = {"status": status, "message": message, "pending_questions": pending_questions, **extra}
         if screenshot:
             payload["screenshot"] = screenshot
@@ -517,38 +575,38 @@ async def run_application(
                         if transport.enabled and request.method not in {"GET", "HEAD", "OPTIONS"}:
                             if clicked and request.method == "POST" and transport.is_submit_url(request.url) and final_request_count == 0:
                                 final_request_count += 1
-                                await progress.emit("submitting")
+                                await emit_progress("submitting")
                                 await route.continue_()
-                                await progress.emit("awaiting_confirmation")
+                                await emit_progress("awaiting_confirmation")
                                 return
                             if not request.is_navigation_request():
                                 upload_body = transport.prepare_upload(request.url, request.method, request.headers, request.post_data_buffer)
                                 if upload_body is not None:
-                                    await progress.emit("uploading_resume")
+                                    await emit_progress("uploading_resume")
                                     await route.continue_(post_data=upload_body)
                                     return
-                            blocked_requests.append("unapproved_transport")
+                            record_blocked_request(request)
                             await route.abort()
                             return
                         if not clicked and (request.method not in {"GET", "HEAD", "OPTIONS"} or loaded_document and request.is_navigation_request()):
-                            blocked_requests.append("premature_submission")
+                            record_blocked_request(request)
                             await route.abort()
                             return
                         try:
                             validate_destination_url(request.url, url, allowed_hosts, fixture=fixture, document=request.is_navigation_request())
                         except URLNotApproved:
-                            blocked_requests.append("destination")
+                            record_blocked_request(request)
                             await route.abort()
                             return
                         if clicked and request.method == "POST":
                             if final_request_count:
-                                blocked_requests.append("duplicate_submission")
+                                record_blocked_request(request)
                                 await route.abort()
                                 return
                             final_request_count += 1
-                            await progress.emit("submitting")
+                            await emit_progress("submitting")
                             await route.continue_()
-                            await progress.emit("awaiting_confirmation")
+                            await emit_progress("awaiting_confirmation")
                             return
                     await route.continue_()
 
@@ -569,18 +627,18 @@ async def run_application(
                         submission_responses.append(response.status)
                 page.on("response", observe_response)
                 page.set_default_timeout(8000)
-                await progress.emit("opening_form")
+                await emit_progress("opening_form")
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 loaded_document = True
                 validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
-                await progress.emit("inspecting_form")
+                await emit_progress("inspecting_form")
                 await page.locator("input,select,textarea").first.wait_for(state="attached", timeout=10000)
 
                 async def snapshot() -> dict:
                     validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                     if blocked_requests:
                         raise URLNotApproved("An unapproved destination was blocked.")
-                    await progress.emit("inspecting_form")
+                    await emit_progress("inspecting_form")
                     current = await page.evaluate(_SNAPSHOT_JS, uuid.uuid4().hex)
                     if transport.upload_success:
                         for field in current.get("fields", []):
@@ -594,7 +652,7 @@ async def run_application(
 
                 state = await snapshot()
                 for _ in range(3):
-                    await progress.emit("checking_answers")
+                    await emit_progress("checking_answers")
                     blockers = _form_blockers(state, url, allowed_hosts, fixture)
                     plan = plan_form(state["fields"], profile, resume_path)
                     pending_questions = plan.pending_questions
@@ -606,7 +664,7 @@ async def run_application(
                     field_actions = [action for action in plan.actions if action.kind != "file"]
                     completed_fields = 0
                     if field_actions:
-                        await progress.emit("filling_fields", field_count=len(field_actions), completed_fields=0)
+                        await emit_progress("filling_fields", field_count=len(field_actions), completed_fields=0)
                     for action in plan.actions:
                         validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                         if blocked_requests:
@@ -621,6 +679,7 @@ async def run_application(
                         elif action.kind == "check":
                             await control.set_checked(action.value)
                         elif action.kind == "file":
+                            workflow_phase = "uploading_resume"
                             if transport.enabled:
                                 try:
                                     await transport.begin_upload()
@@ -633,12 +692,12 @@ async def run_application(
                                 await control.set_input_files(action.value)
                         if action.kind != "file":
                             completed_fields += 1
-                            await progress.emit("filling_fields", field_count=len(field_actions), completed_fields=completed_fields)
+                            await emit_progress("filling_fields", field_count=len(field_actions), completed_fields=completed_fields)
                     state = await snapshot()
                 else:
                     return await result("needs_attention", "The application kept changing while fields were filled.")
 
-                await progress.emit("checking_answers")
+                await emit_progress("checking_answers")
                 final_plan = plan_form(state["fields"], profile, resume_path)
                 pending_questions = final_plan.pending_questions
                 blockers = _form_blockers(state, url, allowed_hosts, fixture) + final_plan.blockers
@@ -677,14 +736,17 @@ async def run_application(
                 )
                 validate_destination_url(page.url, url, allowed_hosts, fixture=fixture, document=True)
                 if blocked_requests:
-                    return await result("uncertain", "A destination was blocked after the single submission attempt. Do not retry automatically.")
+                    return await result("uncertain", "A guarded request was blocked after the single submission attempt. Do not retry automatically.")
                 if not submission_responses or any(status >= 400 for status in submission_responses) or not any(200 <= status < 400 for status in submission_responses):
                     return await result("uncertain", "A confirmation appeared without a successful application request. Verify the employer outcome; do not retry automatically.")
                 return await result("submitted", "The approved site displayed an application confirmation.", confirmation="Recognized application-submitted or thank-you message on the approved origin.")
             finally:
                 await browser.close()
     except URLNotApproved:
-        return await result("uncertain" if clicked else "needs_attention", "An unapproved application destination was blocked." + (" Do not retry automatically." if clicked else ""))
+        message = "A guarded application request was blocked." if blocked_requests else "An unapproved application destination was blocked."
+        return await result("uncertain" if clicked else "needs_attention", message + (" Do not retry automatically." if clicked else ""))
     except Exception:
         # Exception strings can contain field values or URLs; never persist them.
+        if blocked_requests:
+            return await result("uncertain" if clicked else "needs_attention", "A guarded application request was blocked." + (" Do not retry automatically." if clicked else " Review the transport details before retrying."))
         return await result("uncertain" if clicked else "failed", "The single submission attempt could not be confirmed. Do not retry automatically." if clicked else "The browser could not complete the guarded application workflow; review it locally.")

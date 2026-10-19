@@ -82,7 +82,7 @@ def test_save_answer_persists_and_reuses_only_the_exact_question(client, tmp_pat
     # It survives a separate app/store instance rather than living in browser state.
     with TestClient(create_app(tmp_path)) as reopened:
         saved = reopened.get("/api/state").json()["answer_memory"]["saved"]
-    assert saved == [{"question": "Favorite language?", "answer": "Python"}]
+    assert saved == [{"question": "Favorite language?", "answer": "Python", "sources": []}]
 
 
 def test_new_answer_revokes_approval_and_stops_automation_but_never_requeues(client):
