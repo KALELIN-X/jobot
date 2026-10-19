@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from datetime import date
 
 import httpx
@@ -132,7 +133,7 @@ def test_failed_detail_keeps_metadata_and_unknown_availability(monkeypatch):
             return httpx.Response(200, text=MARKDOWN)
         return httpx.Response(403)
     monkeypatch.setattr(ingest, "_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    jobs = asyncio.run(ingest.fetch_jobs())
+    jobs = asyncio.run(ingest.fetch_jobright_jobs())
     assert len(jobs) == 2
     assert jobs[0]["title"] == "Engineer"
     assert jobs[0]["closed"] is None
@@ -165,7 +166,7 @@ def test_total_detail_budget_retains_all_metadata_and_joins_cancelled_tasks(monk
     monkeypatch.setattr(ingest, "_fetch_text", slow_fetch)
     monkeypatch.setattr(ingest, "DETAIL_RESOLUTION_BUDGET_SECONDS", 0.02)
     monkeypatch.setattr(ingest, "DETAIL_TIMEOUT_SECONDS", 1)
-    jobs = asyncio.run(ingest.fetch_jobs())
+    jobs = asyncio.run(ingest.fetch_jobright_jobs())
     assert [job["title"] for job in jobs] == ["Engineer", "Backend Engineer"] + ["Queued Engineer"] * 3
     assert all("budget" in job["fetch_error"] for job in jobs)
     assert all(job["closed"] is None and job["description"] == "" for job in jobs)
@@ -186,7 +187,7 @@ def test_per_detail_timeout_preserves_successful_description(monkeypatch):
     monkeypatch.setattr(ingest, "_fetch_text", mixed_fetch)
     monkeypatch.setattr(ingest, "DETAIL_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(ingest, "DETAIL_RESOLUTION_BUDGET_SECONDS", 1)
-    jobs = asyncio.run(ingest.fetch_jobs())
+    jobs = asyncio.run(ingest.fetch_jobright_jobs())
     assert "Java and Python" in jobs[0]["description"]
     assert "request exceeded" in jobs[1]["fetch_error"]
     assert jobs[1]["closed"] is None
@@ -202,11 +203,13 @@ def test_source_has_total_read_deadline_and_does_not_start_details(monkeypatch):
     monkeypatch.setattr(ingest, "_fetch_text", slow_source)
     monkeypatch.setattr(ingest, "SOURCE_READ_TIMEOUT_SECONDS", 0.01)
     with pytest.raises(RuntimeError, match="repository read timed out"):
-        asyncio.run(ingest.fetch_jobs())
+        asyncio.run(ingest.fetch_jobright_jobs())
     assert requested == [ingest.SOURCE_URL]
 
 
-def posting(title="Engineer", location="Boston, MA", role="role", board="acme"):
+def posting(title="Engineer", location="Boston, MA", role="12345678-abcd-1234-abcd-123456789abc", board="acme"):
+    if role in {"role", "other", "duplicate"}:
+        role = str(uuid.uuid5(uuid.NAMESPACE_URL, role))
     return {"text": title, "categories": {"location": location},
             "applyUrl": f"https://jobs.lever.co/{board}/{role}/apply",
             "descriptionPlain": "Build Python APIs and production backend services. " * 4}

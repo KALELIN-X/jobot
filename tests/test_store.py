@@ -14,6 +14,38 @@ def job(job_id="first", **changes):
     return {"id": job_id, "status": "new", "apply_url": URL, "title": "Original title", **changes}
 
 
+def test_feed_refresh_preserves_review_questions_and_confirmation_but_not_old_destinations(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    store.save_job(job(destination_provenance={"old": "source"}))
+    question = {"question": "Preferred editor?", "type": "text"}
+    store.update_job("first", "needs_attention", pending_questions=[question], form_questions=[question],
+                     questions_refreshed_at="2026-10-18T12:00:00+00:00", confirmation="Recorded receipt", error="Review needed")
+    store.save_job(job(title="Fresh title", apply_url=None, destination_provenance=None))
+    saved = store.job("first")
+    assert saved["title"] == "Fresh title"
+    assert saved["status"] == "needs_attention"
+    assert saved["pending_questions"] == [question]
+    assert saved["form_questions"] == [question]
+    assert saved["questions_refreshed_at"] == "2026-10-18T12:00:00+00:00"
+    assert saved["confirmation"] == "Recorded receipt"
+    assert saved["error"] == "Review needed"
+    assert saved["apply_url"] is None
+    assert saved["destination_provenance"] is None
+
+
+def test_feed_cannot_replace_explicitly_refreshed_question_metadata_with_stale_payload(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    store.save_job(job())
+    store.update_job("first", "needs_attention", form_questions=[], pending_questions=[],
+                     questions_refreshed_at="2026-10-18T12:30:00+00:00")
+    store.save_job(job(title="Fresh source title", form_questions=[{"question": "Stale source question"}],
+                       questions_refreshed_at="2020-01-01T00:00:00+00:00"))
+    refreshed = store.job("first")
+    assert refreshed["title"] == "Fresh source title"
+    assert refreshed["form_questions"] == refreshed["pending_questions"] == []
+    assert refreshed["questions_refreshed_at"] == "2026-10-18T12:30:00+00:00"
+
+
 @pytest.mark.parametrize("variant", [
     URL,
     URL.replace("jobs.lever.co", "JOBS.LEVER.CO"),
@@ -45,33 +77,35 @@ def test_canonical_key_rejects_untrusted_or_unrecognized_urls(url):
     assert application_key(job(apply_url=url)) is None
 
 
-def test_same_destination_cannot_reserve_under_a_different_feed_id(tmp_path):
+@pytest.mark.parametrize("limit", [5, None])
+def test_same_destination_cannot_reserve_under_a_different_feed_id(tmp_path, limit):
     store = Store(tmp_path / "db.sqlite3")
     store.save_job(job(status="filling"))
     store.save_job(job("second", status="filling", apply_url=URL.lower() + "?source=reposted"))
     assert store.attempt_count("2026-10-18") == 0
     assert not store.destination_attempted(job("second"))
-    store.reserve_attempt("first", "2026-10-18", 5)
+    store.reserve_attempt("first", "2026-10-18", limit)
     assert store.attempt_count("2026-10-18") == 1
     assert store.attempt_count("2026-10-19") == 0
     assert store.destination_attempted(job("second"))
     assert not store.destination_attempted(job("demo", demo=True))
     assert not store.destination_attempted(job("different", apply_url=URL.replace("Example", "Other")))
     with pytest.raises(ValueError, match="another feed record"):
-        store.reserve_attempt("second", "2026-10-19", 5)
+        store.reserve_attempt("second", "2026-10-19", limit)
     assert store.job("second")["attempted_at"] is None
     with store.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
 
 
-def test_destination_dedupe_is_atomic_across_workers(tmp_path):
+@pytest.mark.parametrize("limit", [5, None])
+def test_destination_dedupe_is_atomic_across_workers(tmp_path, limit):
     store = Store(tmp_path / "db.sqlite3")
     for candidate in (job("one", status="filling"), job("two", status="filling")):
         store.save_job(candidate)
 
     def reserve(job_id):
         try:
-            store.reserve_attempt(job_id, "2026-10-18", 5)
+            store.reserve_attempt(job_id, "2026-10-18", limit)
             return True
         except ValueError:
             return False

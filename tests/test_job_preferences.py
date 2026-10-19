@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from jobradar.app import create_app, ordered_queue
 from jobradar.models import Rules
+from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
@@ -13,7 +14,10 @@ BASE_RULES = {"companies": ["Example"], "company_boards": {"Example": "example"}
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    async def refreshed(job):
+        return {**job, "closed":False, "candidate_refresh":{"status":"verified","message":"Synthetic official refresh"}}
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
 
@@ -51,7 +55,7 @@ def test_queue_preference_changes_priority_without_changing_fit_scores(prefer_ne
 
 
 def configure_and_approve(client, **preferences):
-    assert client.post("/api/profile", headers=HEADERS, json={"name": "Alex Example", "email": "alex@example.test"}).status_code == 200
+    assert client.post("/api/profile", headers=HEADERS, json={"name":"Alex Example", "email":"alex@example.test", "approved_work_locations":["Boston"], "work_authorized":True, "needs_sponsorship":False}).status_code == 200
     assert client.post("/api/rules", headers=HEADERS, json={**BASE_RULES, **preferences}).status_code == 200
     assert client.post("/api/resume", headers=HEADERS, files={"file": ("resume.txt", b"Built Python APIs", "text/plain")}).status_code == 200
     fingerprint = client.get("/api/state").json()["approval"]["candidate_fingerprint"]
@@ -78,9 +82,13 @@ def test_api_persists_adjustable_preferences_and_revokes_prior_approval(client):
 def test_running_queue_uses_preference_then_unchanged_fit_score(client, monkeypatch, prefer_new_grad, expected):
     configure_and_approve(client, prefer_new_grad=prefer_new_grad)
     for index, (identifier, score, is_new_grad) in enumerate([("new-grad", 70, True), ("experienced", 95, False)]):
+        apply_url = f"https://jobs.lever.co/example/12345678-abcd-1234-abcd-{index:012x}/apply"
+        detail_url = f"https://jobright.ai/jobs/info/synthetic-{identifier}"
         client.app.state.store.save_job({
             "id": identifier, "company": "Example", "title": "Backend Engineer", "location": "Boston",
-            "ats": "lever", "apply_url": f"https://jobs.lever.co/example/12345678-abcd-1234-abcd-{index:012x}/apply",
+            "ats": "lever", "apply_url": apply_url,
+            "source": "Jobright", "source_url": SOURCE_URL, "detail_url": detail_url,
+            "destination_provenance": destination_provenance(apply_url, "jobright_detail", detail_url),
             "description": "Build Python backend APIs.", "score": score,
             "score_detail": {"is_new_grad": is_new_grad, "eligibility": []}, "status": "queued",
         })
@@ -97,4 +105,4 @@ def test_running_queue_uses_preference_then_unchanged_fit_score(client, monkeypa
     while client.get("/api/state").json()["automation"]["running"] and time.monotonic() < deadline:
         time.sleep(0.01)
     assert [identifier for identifier, _ in observed] == expected
-    assert dict(observed) == {"new-grad": 70, "experienced": 95}
+    assert dict(observed) == {"new-grad":100, "experienced":100}  # Current official descriptions are reranked before filling.

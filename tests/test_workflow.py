@@ -2,16 +2,18 @@
 import asyncio
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from jobradar.app import create_app
+from jobradar.ingest import SOURCE_URL, destination_provenance
 
 
 HEADERS = {"X-JobRadar-Client": "dashboard"}
-PROFILE = {"name": "Alex Example", "email": "alex@example.test", "location": "Boston, MA",
+PROFILE = {"name": "Alex Example", "email": "alex@example.test", "location": "Boston, MA", "approved_work_locations":["Boston, MA"],
            "work_authorized": True, "needs_sponsorship": False, "experience_months": 12,
            "graduation_date": "2027-05-15"}
 RULES = {"companies": ["Example"], "company_boards": {"Example": "example"},
@@ -19,7 +21,10 @@ RULES = {"companies": ["Example"], "company_boards": {"Example": "example"},
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    async def refreshed(job):
+        return {**job, "closed":False, "candidate_refresh":{"status":"verified","message":"Synthetic official refresh"}}
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
 
@@ -36,10 +41,13 @@ def configure_and_approve(client):
 
 
 def add_job(client, identifier, score=95):
+    apply_url = f"https://jobs.lever.co/example/{uuid.uuid5(uuid.NAMESPACE_URL, identifier)}/apply"
+    detail_url = f"https://jobright.ai/jobs/info/synthetic-{identifier}"
     client.app.state.store.save_job({
         "id": identifier, "company": "Example", "title": "Python Backend Engineer",
         "location": "Boston, MA", "work_model": "On Site", "ats": "lever",
-        "apply_url": f"https://jobs.lever.co/example/{identifier}/apply",
+        "apply_url": apply_url, "source": "Jobright", "source_url": SOURCE_URL, "detail_url": detail_url,
+        "destination_provenance": destination_provenance(apply_url, "jobright_detail", detail_url),
         "description": "Build and maintain reliable Python backend services and REST APIs for customers.",
         "closed": False, "score": score,
         "score_detail": {"eligibility": [{"label": "Verified test condition", "status": "pass", "detail": "Synthetic test only"}]},
@@ -170,3 +178,109 @@ def test_second_immediate_run_and_demo_are_rejected_while_queue_active(client, m
     assert filled == ["active"]
     assert not refused
     assert not any(job.get("demo") for job in client.app.state.store.jobs())
+
+
+def test_unknown_questions_are_preserved_for_review_without_a_submission_attempt(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "question-needed")
+    question = {"question": "Which editor do you use?", "type": "text", "required": True}
+
+    async def fake_application(job, profile, resume_path, **options):
+        return {"status": "needs_attention", "message": "An exact answer is needed.", "pending_questions": [question]}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", fake_application)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    saved = client.app.state.store.job("question-needed")
+    assert saved["status"] == "needs_attention"
+    assert saved["pending_questions"] == [question]
+    assert saved["attempted_at"] is None
+    assert state["answer_memory"]["pending"][0]["question"] == question["question"]
+    assert state["answer_memory"]["pending"][0]["job_id"] == "question-needed"
+    assert not state["queue"]["can_run"]
+
+
+def test_worker_choices_replace_old_inspection_in_inbox_and_job_bound_answer_save(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "changed-choices")
+    store = client.app.state.store
+    old = {"question": "Which shift?", "type": "select", "required": True,
+           "options": [{"label": "Day", "value": "day"}]}
+    current = {**old, "options": [{"label": "Night", "value": "night"}]}
+    unrelated = {"question": "Preferred editor?", "type": "text", "required": False, "options": []}
+    store.update_job("changed-choices", "queued", form_questions=[old, unrelated],
+                     pending_questions=[], questions_refreshed_at="2020-01-01T00:00:00+00:00")
+
+    async def changed_form(job, profile, resume_path, **options):
+        assert job["form_questions"] == [old, unrelated]
+        return {"status": "needs_attention", "message": "A current shift answer is needed.",
+                "pending_questions": [current]}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", changed_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    saved = store.job("changed-choices")
+    assert saved["form_questions"] == [unrelated, current]
+    assert saved["questions_refreshed_at"] != "2020-01-01T00:00:00+00:00"
+    inbox = next(item for item in state["answer_memory"]["pending"] if item["job_id"] == "changed-choices")
+    assert inbox["options"] == current["options"]
+    rejected = client.post("/api/answers", headers=HEADERS,
+                           json={"job_id": "changed-choices", "question": "Which shift?", "answer": "Day"})
+    assert rejected.status_code == 422
+    accepted = client.post("/api/answers", headers=HEADERS,
+                           json={"job_id": "changed-choices", "question": "Which shift?", "answer": "Night"})
+    assert accepted.status_code == 200, accepted.text
+    assert store.get("profile")["answers"]["Which shift?"] == "Night"
+    source = client.get("/api/state").json()["answer_memory"]["saved"][0]["sources"][0]
+    assert source["options"] == current["options"]
+    assert unrelated in store.job("changed-choices")["form_questions"]
+    assert saved["attempted_at"] is None
+
+
+@pytest.mark.parametrize("existing_conflict", [False, True])
+def test_worker_question_merge_keeps_distinct_same_label_controls_for_manual_review(client, monkeypatch, existing_conflict):
+    configure_and_approve(client)
+    add_job(client, "conflicting-controls")
+    store = client.app.state.store
+    old = {"question": "Which shift?", "type": "select", "required": True,
+           "options": [{"label": "Day", "value": "day"}]}
+    other_control = {"question": "Which shift?", "type": "text", "required": True, "options": []}
+    current = {**old, "options": [{"label": "Night", "value": "night"}]}
+    prior = [old, other_control] if existing_conflict else [old]
+    incoming = [current] if existing_conflict else [current, other_control]
+    store.update_job("conflicting-controls", "queued", form_questions=prior)
+
+    async def conflicting_form(*args, **kwargs):
+        return {"status": "needs_attention", "message": "Conflicting controls need review.",
+                "pending_questions": incoming}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", conflicting_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    state = await_idle(client)
+    recorded = store.job("conflicting-controls")["form_questions"]
+    assert current in recorded and other_control in recorded
+    inbox = state["answer_memory"]["pending"][0]
+    assert inbox["conflicting_controls"] is True and inbox["options"] == []
+    result = client.post("/api/answers", headers=HEADERS,
+                         json={"job_id": "conflicting-controls", "question": "Which shift?", "answer": "Night"})
+    assert result.status_code == 409
+    assert not store.get("profile").get("answers")
+
+
+def test_worker_without_new_questions_preserves_prior_observations(client, monkeypatch):
+    configure_and_approve(client)
+    add_job(client, "unchanged-observations")
+    recorded = {"question": "Preferred editor?", "type": "text", "required": False, "options": []}
+    store = client.app.state.store
+    store.update_job("unchanged-observations", "queued", form_questions=[recorded],
+                     questions_refreshed_at="2020-01-01T00:00:00+00:00")
+
+    async def failed_form(*args, **kwargs):
+        return {"status": "failed", "message": "Synthetic form could not be opened."}
+
+    monkeypatch.setattr("jobradar.autofill.run_application", failed_form)
+    assert client.post("/api/run", headers=HEADERS).status_code == 200
+    await_idle(client)
+    saved = store.job("unchanged-observations")
+    assert saved["form_questions"] == [recorded]
+    assert saved["questions_refreshed_at"] == "2020-01-01T00:00:00+00:00"

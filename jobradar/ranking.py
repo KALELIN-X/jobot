@@ -5,6 +5,9 @@ import re
 from datetime import date
 from typing import Any
 
+from .models import company_scope
+from .locations import location_matches
+
 # Aliases describe one concept, so e.g. AWS is never counted twice.
 _SKILLS: dict[str, tuple[str, ...]] = {
     "Python": ("python",), "Java": ("java",),
@@ -170,9 +173,10 @@ def _graduation_check(text: str, profile: dict) -> dict:
     if not relevant:
         return _entry("Graduation date", "pass", "No explicit graduation-date constraint was found in the available description.")
     constraint = " ".join(relevant)[:600]
-    supplied = profile.get("graduation_date")
+    supplied = profile.get("graduation_date") or profile.get("graduation_month")
     try:
-        graduation = date.fromisoformat(str(supplied)) if supplied else None
+        value = str(supplied)
+        graduation = date.fromisoformat(value + "-01" if re.fullmatch(r"\d{4}-\d{2}", value) else value) if supplied else None
     except ValueError:
         graduation = None
     if not graduation:
@@ -181,20 +185,20 @@ def _graduation_check(text: str, profile: dict) -> dict:
     # they can be interpreted exactly; a year-only comparison must not approve them.
     years = [int(year) for year in re.findall(r"\b20\d\d\b", constraint)]
     if re.search(r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|spring|summer|fall|autumn|winter)\b", constraint, re.I):
-        return _entry("Graduation date", "unknown", f"Your date is {graduation.isoformat()}; verify the posting's specific month/season window: {constraint}")
+        return _entry("Graduation date", "unknown", f"Your supplied graduation is {supplied}; verify the posting's specific month/season window: {constraint}")
     if len(set(years)) == 1 and re.search(r"\b(?:before|by|after|since|prior|within)\b", constraint, re.I):
-        return _entry("Graduation date", "unknown", f"Verify the graduation cutoff against {graduation.isoformat()}: {constraint}")
+        return _entry("Graduation date", "unknown", f"Verify the graduation cutoff against {supplied}: {constraint}")
     if years:
         lower, upper = min(years), max(years)
         return _entry("Graduation date", "pass" if lower <= graduation.year <= upper else "fail",
-                      f"Posting graduation years {lower}–{upper}; your supplied date is {graduation.isoformat()}.")
+                      f"Posting graduation years {lower}–{upper}; your supplied graduation is {supplied}.")
     return _entry("Graduation date", "unknown", f"Verify the graduation requirement: {constraint}")
 
 
 def _experience_requirement(text: str, job: dict) -> dict:
     """Extract explicit numeric constraints without turning a job title into one."""
     requirements = job.get("requirements") or []
-    pattern = re.compile(r"\b(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?\s*(\+)?\s*(years?|months?)\s+"
+    pattern = re.compile(r"\b(\d{1,2})(?:\s*(?:[-–—]|to)\s*(\d{1,2}))?\s*(\+)?\s*(years?|months?)\s+"
                          r"(?:(?:of\s+)?(?:[\w/-]+\s+){0,5}experience\b"
                          r"|as\s+(?:a\s+)?(?:software\s+engineer|(?:software\s+)?developer|programmer)\b)", re.I)
     found: list[tuple[int, int | None, str]] = []
@@ -295,16 +299,14 @@ def _new_grad_signal(title: str, description: str) -> bool:
 def _eligibility(job: dict, profile: dict, rules: dict, description: str, experience: dict) -> list[dict]:
     result = []
     companies = rules.get("companies") or []
-    if companies:
+    if company_scope(rules) == "selected":
         allowed = _norm(job.get("company")) in {_norm(company) for company in companies}
         result.append(_entry("Approved company", "pass" if allowed else "fail", f"{job.get('company') or 'Unknown company'} {'is' if allowed else 'is not'} in your company allowlist."))
     locations = rules.get("locations") or []
     location = str(job.get("location") or "")
     work_model = str(job.get("work_model") or "")
     if locations:
-        actual = _norm(location + " " + work_model)
-        allowed = any(_norm(value) and re.search(r"(?<!\w)" + re.escape(_norm(value)) + r"(?!\w)", actual)
-                      for value in locations)
+        allowed = location_matches(job, locations)
         result.append(_entry("Approved location", "pass" if allowed else "fail", f"Posting location: {location or 'unknown'} ({work_model or 'work model unknown'}); compared with your location allowlist."))
     ats = str(job.get("ats") or "unsupported")
     allowed_ats = rules.get("allowed_ats") or []
@@ -321,7 +323,10 @@ def _eligibility(job: dict, profile: dict, rules: dict, description: str, experi
         result.append(_entry("Full description", "unknown", "Resolve the full job description before checking job requirements."))
         return result
     text = str(job.get("title") or "") + "\n" + description
-    result.extend((_graduation_check(text, profile), _experience_check(experience, profile)))
+    graduation = _graduation_check(text, profile)
+    if rules.get("enforce_graduation_window", True) is False and graduation["status"] != "pass":
+        graduation = _entry("Graduation date", "waived", "Graduation-window filter is off. Your actual education dates still apply. " + graduation["detail"])
+    result.extend((graduation, _experience_check(experience, profile)))
     experience_limit = rules.get("max_required_experience_months")
     if isinstance(experience_limit, int) and not isinstance(experience_limit, bool):
         if experience["status"] == "known":
@@ -333,8 +338,7 @@ def _eligibility(job: dict, profile: dict, rules: dict, description: str, experi
     job_location = _norm(location)
     is_remote = "remote" in _norm(work_model)
     approved_location = next((str(value) for value in (profile.get("approved_work_locations") or [])
-                              if isinstance(value, str) and _norm(value)
-                              and re.search(r"(?<!\w)" + re.escape(_norm(value)) + r"(?!\w)", job_location)), None)
+                              if isinstance(value, str) and location_matches(job, [value])), None)
     if not location:
         result.append(_entry("Work location", "unknown", "Posting work location is missing."))
     elif approved_location:
@@ -383,7 +387,7 @@ def rank_job(job: dict, profile: dict, resume_text: str, rules: dict) -> dict:
     experience = _experience_requirement(title + "\n" + description, job)
     result: dict = {"score": None, "matches": [], "not_evidenced": [],
                     "experience_requirement": experience,
-                    "is_new_grad": _new_grad_signal(title, description),
+                    "is_new_grad": job.get("source_new_grad") is True or _new_grad_signal(title, description),
                     "eligibility": _eligibility(job, profile, rules, description, experience),
                     "reasons": ["Score measures weighted technical keyword evidence in your resume; it is not an interview probability or an eligibility decision."]}
     if not description:

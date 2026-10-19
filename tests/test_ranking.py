@@ -105,7 +105,7 @@ def test_sponsorship_inference_does_not_guarantee_sponsorship():
 
 
 def test_location_allowlist_matches_whole_terms():
-    result = rank_job(job(location="Austin, TX"), profile(), "Python", {"locations": ["US"]})
+    result = rank_job(job(location="Austin, TX"), profile(), "Python", {"locations": ["Austinshire"]})
     assert status(result, "Approved location") == "fail"
 
 
@@ -240,8 +240,8 @@ def test_explicit_approved_work_location_does_not_change_contact_address():
 def test_contact_address_and_substring_are_not_work_location_approvals():
     result = rank_job(job(), profile(approved_work_locations=[]), "Python", {})
     assert status(result, "Work location") == "unknown"
-    substring = rank_job(job(location="Austin, TX"), profile(approved_work_locations=["US"]), "Python", {})
-    assert status(substring, "Work location") == "unknown"
+    countrywide = rank_job(job(location="Austin, TX"), profile(approved_work_locations=["US"]), "Python", {})
+    assert status(countrywide, "Work location") == "pass"
 
 
 @pytest.mark.parametrize("description, expected", [
