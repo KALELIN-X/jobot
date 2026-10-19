@@ -68,7 +68,8 @@ def test_pending_roles_are_not_misrepresented_as_submission_ready(client):
     assert by_id["ready"]["submission_check"] == {"eligible": True, "matches_rules": True, "blockers": []}
     assert "Lever" in " ".join(by_id["unsupported"]["submission_check"]["blockers"])
     assert "minimum" in " ".join(by_id["low-fit"]["submission_check"]["blockers"])
-    assert "submission_check" not in by_id["demo"]
+    assert "demo" not in by_id
+    assert client.app.state.store.job("demo")["demo"] is True
     assert not state["automation"]["enabled"]
     # Polling must not mutate persisted listings or attempt history.
     assert "submission_check" not in client.app.state.store.job("ready")

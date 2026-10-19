@@ -237,16 +237,18 @@ class Store:
             key = application_key(job)
             return bool((key and connection.execute("SELECT 1 FROM destination_attempts WHERE application_key=?", (key,)).fetchone()) or self._identity_recorded(connection, job))
 
-    def reserve_attempt(self, job_id, day, limit):
-        # Transaction protects against two workers exceeding the quota or submitting twice.
+    def reserve_attempt(self, job_id, day, limit: int | None):
+        # Unlimited mode skips only the quota. The same transaction still
+        # protects durable attempt and destination identities across workers.
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT payload,attempted_at,status FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row or row["attempted_at"] or row["status"] != "filling":
                 raise ValueError("This application already has an attempt or is no longer active.")
-            count = connection.execute("SELECT COUNT(*) FROM attempts WHERE day=?", (day,)).fetchone()[0]
-            if count >= limit:
-                raise ValueError("Daily submission-attempt limit reached (UTC day).")
+            if limit is not None:
+                count = connection.execute("SELECT COUNT(*) FROM attempts WHERE day=?", (day,)).fetchone()[0]
+                if count >= limit:
+                    raise ValueError("Daily submission-attempt limit reached (UTC day).")
             job = json.loads(row["payload"])
             if self._identity_recorded(connection, job):
                 raise ValueError("An application with this employer and title was reported elsewhere. This may be a repost; review it before any new application.")

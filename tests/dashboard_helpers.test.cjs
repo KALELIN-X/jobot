@@ -72,7 +72,7 @@ function queueHelpers() {
   assert.ok(start >= 0 && end > start);
   const context = {list: value => Array.isArray(value) ? value : []};
   vm.createContext(context);
-  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {queueControlState, setupDestination, companyScope, locationMode, exactLines};", context);
+  vm.runInContext(source.slice(start, end) + "\nthis.helpers = {queueControlState, setupDestination, companyScope, locationMode, exactLines, bulkQueueControl, attemptBudgetAvailable, dailyLimitValue};", context);
   return context.helpers;
 }
 
@@ -259,4 +259,28 @@ test("queued jobs stay visible when the optional experience view filter is enabl
   context.experienceFilterEnabled=false;
   vm.runInContext("renderJobs(true);",context);
   assert.match(elements.get("#job-list").innerHTML,/discovered-unknown/);
+});
+
+test("bulk loading uses saved rules and remains clickable with unsaved edits or an empty shortlist", () => {
+  const {bulkQueueControl} = queueHelpers();
+  const snapshot = {rules:{min_score:60},queue:{loadable:27},automation:{running:false}};
+  assert.equal(bulkQueueControl(snapshot,true,false,true).disabled,false);
+  assert.match(bulkQueueControl(snapshot,true,false,true).help,/SAVED score cutoff of 60/);
+  assert.equal(bulkQueueControl({...snapshot,queue:{loadable:0},automation:{running:true}},true).disabled,false);
+  assert.equal(bulkQueueControl(snapshot,false).disabled,true);
+  assert.equal(bulkQueueControl(snapshot,true,true).disabled,true);
+  assert.match(bulkQueueControl(snapshot,true,true).label,/Loading/);
+});
+
+test("unlimited daily capacity permits a run while an exhausted optional cap still blocks it", () => {
+  const {attemptBudgetAvailable,dailyLimitValue} = queueHelpers();
+  assert.equal(attemptBudgetAvailable({remaining_today:null}),true);
+  assert.equal(attemptBudgetAvailable({remaining_today:0}),false);
+  assert.equal(attemptBudgetAvailable({remaining_today:3}),true);
+  assert.equal(attemptBudgetAvailable({}),false);
+  const form = {elements:{daily_limit_enabled:{checked:false},daily_limit:{value:"5"}}};
+  assert.equal(dailyLimitValue(form),null);
+  form.elements.daily_limit_enabled.checked=true;
+  form.elements.daily_limit.value="50";
+  assert.equal(dailyLimitValue(form),50);
 });

@@ -41,7 +41,7 @@ def test_origin_and_header_guards(client):
 def test_profile_malformed_and_unknown_fields(client):
     assert client.post("/api/profile", headers=HEADERS, json={"email": "bad"}).status_code == 422
     assert client.post("/api/profile", headers=HEADERS, json={"email": "a@example.test", "magic_credentials": "no"}).status_code == 422
-    assert client.post("/api/rules", headers=HEADERS, json={"daily_limit": 500}).status_code == 422
+    assert client.post("/api/rules", headers=HEADERS, json={"daily_limit": 501}).status_code == 422
     assert client.post("/api/rules", headers=HEADERS, json={"company_boards": {"Example": "../../evil"}}).status_code == 422
 
 

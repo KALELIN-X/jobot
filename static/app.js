@@ -102,7 +102,7 @@
     if (busyActions.has(name)) return;
     busyActions.add(name);
     const previousHTML = button?.innerHTML;
-    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); }
+    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); if (name === "queue-matching") button.textContent = "Loading jobs to queue…"; }
     try {
       const result = await task();
       await refresh(true);
@@ -215,7 +215,7 @@
     $("#job-count").setAttribute("aria-label",`${jobs.length} of ${allJobs.length} roles shown`);
     $("#experience-filter-detail").textContent = maximum === null ? "" : `${jobs.length} of ${allJobs.length} roles shown · ${maximum === 0 ? "No experience required" : `${maximum/12} year${maximum === 12 ? "" : "s"} maximum required`}${experienceFilterEnabled ? ". Selected queued jobs stay visible. Turn off to see all experience levels." : ". Showing all experience levels; your saved application rules still apply."}`;
     if (!allJobs.length) {
-      $("#job-list").innerHTML = `<div class="empty-state"><div class="empty-radar"><span></span><i></i></div><div class="empty-eyebrow">A LITTLE SETUP. A LOT OF POSSIBILITY.</div><h3>Your next opportunity starts here</h3><p>Add your resume and choose where you want to apply.<br>We’ll help you turn a promising role into a thoughtful application.</p><button class="button button-primary" type="button" data-view="profile">Set up your profile${icon("arrow")}</button><div class="demo-link-row"><button class="text-button" type="button" data-action="demo">Try a local demo <span>↗</span></button><small>Demo uses a local mock employer.</small></div></div>`;
+      $("#job-list").innerHTML = `<div class="empty-state"><div class="empty-radar"><span></span><i></i></div><div class="empty-eyebrow">A LITTLE SETUP. A LOT OF POSSIBILITY.</div><h3>Your next opportunity starts here</h3><p>Add your resume and choose where you want to apply.<br>We’ll help you turn a promising role into a thoughtful application.</p><button class="button button-primary" type="button" data-view="profile">Set up your profile${icon("arrow")}</button></div>`;
       return;
     }
     if (!jobs.length) {
@@ -322,9 +322,25 @@
     $("#custom-locations-field").hidden = !custom;
     form.elements.locations.disabled = !custom;
     form.elements.locations.required = custom;
+    const capped = form.elements.daily_limit_enabled.checked;
+    $("#daily-limit-field").hidden = !capped;
+    form.elements.daily_limit.disabled = !capped;
+    form.elements.daily_limit.required = capped;
     const experience = form.elements.max_required_experience_months;
     const location = form.elements.location_mode;
-    $("#rules-preview").textContent = `${selected ? "Selected companies" : "Any fetched company"} · ${location.selectedOptions[0]?.textContent || "Any location"} · ${experience.selectedOptions[0]?.textContent || "Any experience level"} · ${form.elements.daily_limit.value || "—"} per day`;
+    $("#rules-preview").textContent = `${selected ? "Selected companies" : "Any fetched company"} · ${location.selectedOptions[0]?.textContent || "Any location"} · ${experience.selectedOptions[0]?.textContent || "Any experience level"} · ${capped ? `${form.elements.daily_limit.value || "Choose a cap"} per day` : "No daily cap"}`;
+  }
+  function bulkQueueControl(snapshot, ready, busy = false, unsavedRules = false) {
+    const cutoff = snapshot.rules?.min_score ?? 60;
+    return {disabled:!ready || busy,
+      label:busy ? "Loading jobs to queue…" : `Load jobs to queue (${snapshot.queue?.loadable ?? 0})`,
+      help:!ready ? "Loading saved jobs…" : `${unsavedRules ? "You have unsaved rule edits. This uses your SAVED " : "Uses your saved "}score cutoff of ${cutoff}+. Loads every available matching job across the fetched list. ${unsavedRules ? "Save preferences to use a different cutoff. " : ""}Loading selects jobs; it does not start applications.`};
+  }
+  function attemptBudgetAvailable(queue = {}) {
+    return queue.remaining_today === null || queue.remaining_today > 0;
+  }
+  function dailyLimitValue(form) {
+    return form.elements.daily_limit_enabled.checked ? Number(form.elements.daily_limit.value) : null;
   }
   function queueControlState(snapshot, unsaved = false) {
     const approved = snapshot.approval?.approved === true && !unsaved;
@@ -369,7 +385,7 @@
     const visibleProblems = dirty.profile || dirty.rules ? ["Save your profile or rule changes before approving.",...problems] : problems;
     $("#queue-blockers").innerHTML = visibleProblems.map(problem => `<li>${escape(problem)}</li>`).join("");
     $("#queue-blockers").hidden = !visibleProblems.length || control.running;
-    $("#queue-health").textContent = loaded ? `${queue.queued ?? 0} selected · ${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.loadable ?? 0} available above score cutoff · ${queue.remaining_today ?? "—"} attempts left today (UTC)` : "Loading queue checks…";
+    $("#queue-health").textContent = loaded ? `${queue.queued ?? 0} selected · ${queue.ready ?? 0} ready · ${queue.blocked ?? 0} held · ${queue.loadable ?? 0} available above score cutoff · ${queue.remaining_today === null ? "No daily cap" : `${queue.remaining_today ?? "—"} attempts left today (UTC)`}` : "Loading queue checks…";
     $("#queue-review-button").textContent = setup.length ? "Complete setup →" : control.approved ? "Review rules →" : "Review & approve →";
     $("#queue-review-button").disabled = control.running;
   }
@@ -448,9 +464,11 @@
     $("#profile-status").classList.toggle("ready",approved);
     $("#automation-status").innerHTML = `<span class="status-dot"></span>${running ? "Run in progress" : enabled ? "Automation on" : "Automation off"}`;
     $("#automation-status").classList.toggle("enabled",enabled || running);
-    $("#queue-matching-button").disabled = !loaded || running || !state.queue?.loadable || busyActions.has("queue-matching") || dirty.rules;
-    $("#queue-matching-button").textContent = `Load jobs to queue (${state.queue?.loadable ?? 0})`;
-    $("#bulk-queue-help").textContent = dirty.rules ? "Save your rule changes to use the updated score cutoff." : `Adds all available jobs with a fit score of ${state.rules?.min_score ?? 60}+ across the fetched list. Jobs below the cutoff can be added individually. Submission checks still apply.`;
+    const bulk = bulkQueueControl(state,loaded,busyActions.has("queue-matching"),dirty.rules);
+    $("#queue-matching-button").disabled = bulk.disabled;
+    $("#queue-matching-button").textContent = bulk.label;
+    $("#queue-matching-button").title = bulk.help;
+    $("#bulk-queue-help").textContent = bulk.help;
     const control = queueControlState(state,dirty.profile || dirty.rules);
     $("#run-button").disabled = !loaded || running || busyActions.has("run");
     $("#run-button").title = control.canRun ? "Run eligible applications once; scheduling stays separate" : "Review your setup and the visible queue blockers";
@@ -470,9 +488,9 @@
     const setupProblems = list(state.setup_problems);
     const approveDisabled = !ack || !reviewReady || reviewStale || approved || dirty.profile || dirty.rules || setupProblems.length > 0 || busyActions.has("approve") || running;
     $("#approve-button").disabled = approveDisabled;
-    $("#approve-run-button").disabled = (approved ? running || dirty.profile || dirty.rules || busyActions.has("approve") : approveDisabled) || !state.queue?.ready || setupProblems.length > 0 || !(state.queue?.remaining_today > 0);
+    $("#approve-run-button").disabled = (approved ? running || dirty.profile || dirty.rules || busyActions.has("approve") : approveDisabled) || !state.queue?.ready || setupProblems.length > 0 || !attemptBudgetAvailable(state.queue);
     $("#approve-run-button").innerHTML = `${approved ? "Run approved queue once" : "Approve &amp; run once"}${icon("play")}`;
-    $("#approval-run-help").textContent = setupProblems.length ? "Complete the missing settings above to unlock approval." : !state.queue?.queued ? "Choose jobs using Add to queue first. You can save approval separately." : !state.queue?.ready ? "Your selected roles are held. Answer their questions in Activity or review their checks." : !(state.queue?.remaining_today > 0) ? "Today's attempt limit has been reached (UTC)." : "This runs your selected eligible roles once. Scheduled applications stay a separate choice.";
+    $("#approval-run-help").textContent = setupProblems.length ? "Complete the missing settings above to unlock approval." : !state.queue?.queued ? "Choose jobs using Add to queue first. You can save approval separately." : !state.queue?.ready ? "Your selected roles are held. Answer their questions in Activity or review their checks." : !attemptBudgetAvailable(state.queue) ? "Today's attempt limit has been reached (UTC)." : "This runs your selected eligible roles once. Scheduled applications stay a separate choice.";
     $("#approval-blockers").hidden = !setupProblems.length;
     $("#approval-blockers").innerHTML = `<strong>Complete these before approval</strong><ul>${setupProblems.map(problem => `<li>${escape(problem)}</li>`).join("")}</ul><button type="button" class="text-button" data-action="review-queue">Go to the next missing setting →</button>`;
     $("#approval-title").textContent = reviewStale ? "This review is out of date" : approved ? "Your rules are approved" : "Review before you run";
@@ -492,7 +510,7 @@
     const profile = approvalReview.profile;
     const companies = list(rules.companies);
     const selected = companyScope(rules) === "selected";
-    const fields = [["Applicant",profile.name || "Not saved"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Company scope",selected ? `${companies.length} selected companies` : "Any company from fetched jobs, including future matches"],["Location",list(rules.locations).length ? locationMode(rules.locations) === "us" ? "Anywhere in the U.S." : list(rules.locations).join(", ") : "Any location"],["Experience required",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "None" : `Up to ${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["New grads first",rules.prefer_new_grad ? "Yes" : "No"],["Graduation windows",rules.enforce_graduation_window === false ? "Not enforced; actual dates used" : "Enforced"],["Supported forms",list(rules.allowed_ats).join(", ") || "Disabled"],["Minimum match",`${rules.min_score ?? "—"} / 100`],["Daily limit",`${rules.daily_limit ?? "—"} attempts (UTC day)`],["Schedule interval",`${rules.interval_minutes ?? "—"} minutes`],["Unclear eligibility",rules.require_known_eligibility === false ? "Review not required" : "Pause for review"]];
+    const fields = [["Applicant",profile.name || "Not saved"],["Resume",approvalReview.resume.loaded ? approvalReview.resume.filename || "Uploaded resume" : "Not uploaded"],["Company scope",selected ? `${companies.length} selected companies` : "Any company from fetched jobs, including future matches"],["Location",list(rules.locations).length ? locationMode(rules.locations) === "us" ? "Anywhere in the U.S." : list(rules.locations).join(", ") : "Any location"],["Experience required",experienceLimit(rules) === null ? "Any level" : experienceLimit(rules) === 0 ? "None" : `Up to ${experienceLimit(rules)/12} year${experienceLimit(rules) === 12 ? "" : "s"}`],["New grads first",rules.prefer_new_grad ? "Yes" : "No"],["Graduation windows",rules.enforce_graduation_window === false ? "Not enforced; actual dates used" : "Enforced"],["Supported forms",list(rules.allowed_ats).join(", ") || "Disabled"],["Minimum match",`${rules.min_score ?? "—"} / 100`],["Daily cap",rules.daily_limit == null ? "Unlimited — all selected eligible jobs" : `${rules.daily_limit} attempts (UTC day)`],["Schedule interval",`${rules.interval_minutes ?? "—"} minutes`],["Unclear eligibility",rules.require_known_eligibility === false ? "Review not required" : "Pause for review"]];
     const applicantFields = [["Legal first name",profile.first_name],["Legal last name",profile.last_name],["Preferred name",profile.preferred_first_name],["Email",profile.email],["Phone",profile.phone],["Current location",profile.location],["Approved work locations",list(profile.approved_work_locations).join("; ")],["LinkedIn",profile.linkedin],["GitHub",profile.github],["Portfolio",profile.portfolio],["Skills",list(profile.skills).join(", ")],["Experience months",profile.experience_months],["Graduation",profile.graduation_date || profile.graduation_month],["Work authorized",profile.work_authorized == null ? "Not provided" : profile.work_authorized ? "Yes" : "No"],["Sponsorship needed",profile.needs_sponsorship == null ? "Not provided" : profile.needs_sponsorship ? "Yes" : "No"]];
     const applicantReview = applicantFields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value ?? "Not provided")}</strong></div>`).join("");
     const answerReview = Object.entries(profile.answers || {}).map(([question,answer]) => `<div class="approval-row"><span>${escape(question)}</span><strong>${escape(typeof answer === "boolean" ? answer ? "Yes" : "No" : answer)}</strong></div>`).join("");
@@ -597,7 +615,9 @@
         }
       }
       rulesForm.elements.locations.value = list(rules.locations).join("\n");
-      ["min_score","daily_limit","interval_minutes"].forEach(name => { if (rules[name] !== undefined && rules[name] !== null) rulesForm.elements[name].value = rules[name]; });
+      ["min_score","interval_minutes"].forEach(name => { if (rules[name] !== undefined && rules[name] !== null) rulesForm.elements[name].value = rules[name]; });
+      rulesForm.elements.daily_limit_enabled.checked = rules.daily_limit != null;
+      rulesForm.elements.daily_limit.value = rules.daily_limit ?? "";
       rulesForm.elements.max_required_experience_months.value = rules.max_required_experience_months ?? "";
       rulesForm.elements.prefer_new_grad.checked = rules.prefer_new_grad === true;
       rulesForm.elements.enforce_graduation_window.checked = rules.enforce_graduation_window !== false;
@@ -744,8 +764,6 @@
       if (!job || isDemo(job) || job.attempted_at || ["submitted","applied_elsewhere","active","filling","submitting","applying","uncertain"].includes(String(job.status).toLowerCase())) return;
       const canonical = Boolean(supportedPostingURL(job.apply_url));
       action(`job-${id}`,button,() => post("/api/applied-elsewhere",{job_id:id}),canonical ? "Previous application recorded. Jobot will skip this exact Lever posting." : "Previous application recorded. Listings with the same company and title will be held for review.");
-    } else if (name === "demo") {
-      action("demo",button,async () => { await post("/api/demo"); setView("queue"); },"Local demo created. It uses a mock employer and sends no application to a real company.");
     } else if (name === "review-refresh") {
       action("review-refresh",button,async () => {
         if (!await refresh(true)) throw new Error("Could not refresh the saved review. Check the local server and try again.");
@@ -811,7 +829,7 @@
     const selected = form.elements.company_scope.value === "selected";
     const where = form.elements.location_mode.value;
     const locations = where === "us" ? ["United States","USA","U.S.","US"] : where === "remote" ? ["Remote"] : where === "custom" ? exactLines(form.elements.locations.value) : [];
-    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever","greenhouse"] : [],min_score:Number(form.elements.min_score.value),daily_limit:Number(form.elements.daily_limit.value),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
+    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever","greenhouse"] : [],min_score:Number(form.elements.min_score.value),daily_limit:dailyLimitValue(form),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
     body.max_required_experience_months = form.elements.max_required_experience_months.value === "" ? null : Number(form.elements.max_required_experience_months.value);
     body.prefer_new_grad = form.elements.prefer_new_grad.checked;
     body.enforce_graduation_window = form.elements.enforce_graduation_window.checked;

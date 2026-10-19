@@ -19,6 +19,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .destinations import SUPPORTED_HOSTS, verified_destination
+from .dashboard import application_events
 from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, Rules, company_scope
 from .job_facts import job_facts
 from .store import Store, application_key, now
@@ -178,11 +179,12 @@ def create_app(data_dir: Path | None = None):
         ready = sum(job["submission_check"]["eligible"] for job in pending)
         day = datetime.now(timezone.utc).date().isoformat()
         attempts = store.attempt_count(day)
-        remaining = max(0, rules["daily_limit"] - attempts)
+        daily_limit = rules["daily_limit"]
+        remaining = None if daily_limit is None else max(0, daily_limit - attempts)
         problems = configuration_problems(profile, rules, resume)
         if not valid_approval(profile, rules, resume, approval):
             problems.append("Review and approve your saved profile, resume and application rules.")
-        if not remaining:
+        if remaining == 0:
             problems.append("Daily submission-attempt limit reached (UTC day). Your remaining queue is saved.")
         if not pending:
             problems.append("Your application queue is empty. Add a role to the queue or choose Load jobs to queue before running.")
@@ -190,7 +192,7 @@ def create_app(data_dir: Path | None = None):
             problems.append("No queued roles currently pass your saved rules. Check each role's submission blockers before running.")
         return {"discovered": len(discovered), "matching": matching, "loadable": loadable, "discovery_blocked": len(discovered) - matching,
                 "queued": len(pending), "pending": len(pending), "ready": ready, "blocked": len(pending) - ready,
-                "attempts_today": attempts, "remaining_today": remaining,
+                "attempts_today": attempts, "remaining_today": remaining, "daily_limit_enabled": daily_limit is not None,
                 "can_run": not problems and not worker_busy(), "blockers": problems}
 
     def invalidate():
@@ -251,9 +253,10 @@ def create_app(data_dir: Path | None = None):
             try:
                 _, queue_rules, _, _ = configuration()
                 refresh_day = datetime.now(timezone.utc).date().isoformat()
-                refresh_budget = max(0, queue_rules["daily_limit"] - store.attempt_count(refresh_day))
-                checked_candidates = 0
                 selected = [job for job in store.jobs() if not job.get("demo") and job["status"] == "queued"]
+                refresh_budget = (len(selected) if queue_rules["daily_limit"] is None else
+                                  max(0, queue_rules["daily_limit"] - store.attempt_count(refresh_day)))
+                checked_candidates = 0
                 tracker.start(total=len(selected))
                 for candidate in ordered_queue(selected, queue_rules):
                     # Reload after the prior browser run: a user may have dismissed
@@ -269,7 +272,7 @@ def create_app(data_dir: Path | None = None):
                         finish_status = "paused"
                         break
                     day = datetime.now(timezone.utc).date().isoformat()
-                    if store.attempt_count(day) >= rules["daily_limit"]:
+                    if rules["daily_limit"] is not None and store.attempt_count(day) >= rules["daily_limit"]:
                         store.event("paused", "Daily submission-attempt limit reached (UTC day). The remaining queue is saved.")
                         finish_status = "paused"
                         break
@@ -448,7 +451,11 @@ def create_app(data_dir: Path | None = None):
     def get_state():
         profile, rules, resume, approval = configuration()
         run_snapshot = tracker.snapshot()
-        jobs = store.jobs()
+        if run_snapshot.get("mode") == "demo":
+            run_snapshot = {"status": "idle", "stage": "idle", "message": "No application run recorded yet", "worker_alive": False}
+        stored_jobs = store.jobs()
+        demo_ids = {job["id"] for job in stored_jobs if job.get("demo")}
+        jobs = [job for job in stored_jobs if not job.get("demo")]
         selected = selected_destinations(jobs)
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
@@ -468,7 +475,7 @@ def create_app(data_dir: Path | None = None):
             "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")},
             "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"),
                          "candidate_fingerprint": fingerprint(profile, rules, resume)},
-            "jobs": jobs, "events": store.events(), "answer_memory": answer_memory_state(profile, jobs), "run": run_snapshot,
+            "jobs": jobs, "events": application_events(store.events(), demo_ids), "answer_memory": answer_memory_state(profile, jobs), "run": run_snapshot,
             "stats": {"total": len(real_jobs), "discovered": sum(job["status"] == "new" for job in real_jobs),
                       "queued": sum(job["status"] == "queued" for job in real_jobs),
                       "submitted": sum(job["status"] == "submitted" for job in real_jobs),

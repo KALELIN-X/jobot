@@ -40,7 +40,7 @@ class RunTracker:
             self.value.update(status="interrupted", stage="interrupted", message=STAGES["interrupted"],
                               updated_at=now(), finished_at=now())
             self._save()
-            store.event("run_interrupted", "The previous run was interrupted. Check recorded outcomes before retrying.")
+            store.event("demo_run_interrupted" if self.value.get("mode") == "demo" else "run_interrupted", "The previous run was interrupted. Check recorded outcomes before retrying.")
 
     def _save(self):
         self.store.set("last_run", self.value)
@@ -57,7 +57,7 @@ class RunTracker:
                           "field_count": None, "completed_fields": None, "pending_question_count": 0,
                           "timeline": []}
             self._save()
-            self.store.event("run_started", f"{'Local demo' if mode == 'demo' else 'Application queue'} worker started with {self.value['total']} selected role(s).")
+            self.store.event("demo_run_started" if mode == "demo" else "run_started", f"{'Local demo' if mode == 'demo' else 'Application queue'} worker started with {self.value['total']} selected role(s).")
 
     def heartbeat(self):
         with self.lock:
@@ -89,7 +89,7 @@ class RunTracker:
                 self.value["timeline"] = (self.value.get("timeline", []) + [item])[-24:]
                 active = self.value.get("active_job") or {}
                 prefix = f"{active.get('company', '')} — {active.get('title', '')}: " if active else ""
-                self.store.event("application_progress", prefix + STAGES[stage], current[1])
+                self.store.event("demo_progress" if self.value.get("mode") == "demo" else "application_progress", prefix + STAGES[stage], current[1])
             self._save()
 
     def outcome(self, job, result):
@@ -122,7 +122,7 @@ class RunTracker:
             self.value.update(status=status, stage=status, message=STAGES[status],
                               updated_at=now(), finished_at=now())
             self._save()
-            self.store.event("run_finished", f"{STAGES[status]}: {self.value['processed']} processed, {self.value['submitted']} confirmed, {self.value['needs_attention']} need answers/review, {self.value['uncertain']} uncertain, {self.value['failed']} failed.")
+            self.store.event("demo_run_finished" if self.value.get("mode") == "demo" else "run_finished", f"{STAGES[status]}: {self.value['processed']} processed, {self.value['submitted']} confirmed, {self.value['needs_attention']} need answers/review, {self.value['uncertain']} uncertain, {self.value['failed']} failed.")
 
     def snapshot(self):
         with self.lock:

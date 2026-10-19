@@ -127,7 +127,7 @@ class Rules(StrictModel):
     min_score: int = Field(default=60, ge=0, le=100)
     max_required_experience_months: int | None = Field(default=None, strict=True, ge=0, le=120)
     prefer_new_grad: StrictBool = False
-    daily_limit: int = Field(default=5, ge=1, le=20)
+    daily_limit: int | None = Field(default=None, strict=True, ge=1, le=500)
     interval_minutes: int = Field(default=360, ge=30, le=1440)
     require_known_eligibility: bool = True
     enforce_graduation_window: StrictBool = True

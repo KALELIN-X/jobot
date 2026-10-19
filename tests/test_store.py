@@ -61,33 +61,35 @@ def test_canonical_key_rejects_untrusted_or_unrecognized_urls(url):
     assert application_key(job(apply_url=url)) is None
 
 
-def test_same_destination_cannot_reserve_under_a_different_feed_id(tmp_path):
+@pytest.mark.parametrize("limit", [5, None])
+def test_same_destination_cannot_reserve_under_a_different_feed_id(tmp_path, limit):
     store = Store(tmp_path / "db.sqlite3")
     store.save_job(job(status="filling"))
     store.save_job(job("second", status="filling", apply_url=URL.lower() + "?source=reposted"))
     assert store.attempt_count("2026-10-18") == 0
     assert not store.destination_attempted(job("second"))
-    store.reserve_attempt("first", "2026-10-18", 5)
+    store.reserve_attempt("first", "2026-10-18", limit)
     assert store.attempt_count("2026-10-18") == 1
     assert store.attempt_count("2026-10-19") == 0
     assert store.destination_attempted(job("second"))
     assert not store.destination_attempted(job("demo", demo=True))
     assert not store.destination_attempted(job("different", apply_url=URL.replace("Example", "Other")))
     with pytest.raises(ValueError, match="another feed record"):
-        store.reserve_attempt("second", "2026-10-19", 5)
+        store.reserve_attempt("second", "2026-10-19", limit)
     assert store.job("second")["attempted_at"] is None
     with store.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
 
 
-def test_destination_dedupe_is_atomic_across_workers(tmp_path):
+@pytest.mark.parametrize("limit", [5, None])
+def test_destination_dedupe_is_atomic_across_workers(tmp_path, limit):
     store = Store(tmp_path / "db.sqlite3")
     for candidate in (job("one", status="filling"), job("two", status="filling")):
         store.save_job(candidate)
 
     def reserve(job_id):
         try:
-            store.reserve_attempt(job_id, "2026-10-18", 5)
+            store.reserve_attempt(job_id, "2026-10-18", limit)
             return True
         except ValueError:
             return False
