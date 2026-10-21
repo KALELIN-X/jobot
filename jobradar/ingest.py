@@ -120,7 +120,11 @@ def _public_application_url(value: Any) -> str | None:
 
 def classify_ats(url: str | None) -> str:
     safe = _public_application_url(url)
-    return _ATS_HOSTS.get(urlsplit(safe).hostname, "unsupported") if safe else "unsupported"
+    if not safe:
+        return "unsupported"
+    from .platforms import platform_for_url
+    platform = platform_for_url(safe)
+    return platform if platform != "unknown" else _ATS_HOSTS.get(urlsplit(safe).hostname, "unsupported")
 
 
 def canonical_lever_application_url(url: Any) -> str | None:

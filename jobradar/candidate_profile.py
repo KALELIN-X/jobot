@@ -53,6 +53,7 @@ class ApplicationFacts(CandidateModel):
     pronouns: StrictStr | None = Field(default=None, min_length=1, max_length=100)
     postal_code: StrictStr | None = Field(default=None, min_length=1, max_length=30)
     current_country: StrictStr | None = Field(default=None, min_length=1, max_length=100)
+    current_city: StrictStr | None = Field(default=None, min_length=1, max_length=200)
     current_state: StrictStr | None = Field(default=None, min_length=1, max_length=100)
     us_citizen: StrictBool | None = None
     sponsorship_now: StrictBool | None = None
@@ -294,6 +295,7 @@ def onboarding_catalog() -> list[dict]:
              _field("phone", "Phone including country code", "tel", storage="profile"),
              _field("location", "Current city, state and country", storage="profile", description="Where you live now, separate from places you would move to."),
              _field("current_country", "Current country (for separate address fields)"),
+             _field("current_city", "Current city (for separate address fields)", description="Only the city name. Jobot does not split or guess it from your full location."),
              _field("current_state", "Current state or region (for separate address fields)"),
              _field("postal_code", "Current postal code"),
              _field("linkedin", "LinkedIn profile", "url", storage="profile"),

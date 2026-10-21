@@ -24,6 +24,7 @@
   let lastSyncAt = null;
   let connectionLost = false;
   let lastInboxSignature = "";
+  let lastPlatformSignature = "";
   const questionDrafts = new Map();
   const questionSearches = new Map();
   const questionSources = new Map();
@@ -115,7 +116,7 @@
     if (busyActions.has(name)) return;
     busyActions.add(name);
     const previousHTML = button?.innerHTML;
-    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); if (name === "queue-matching") button.textContent = "Loading jobs to queue…"; else if (name.startsWith("questions-")) button.textContent = button.dataset.action === "search-choices" ? "Searching choices…" : "Reading form…"; }
+    if (button) { button.disabled = true; button.classList.add("busy"); button.setAttribute("aria-busy","true"); if (name === "queue-matching") button.textContent = "Loading jobs to queue…"; else if (name.startsWith("platform-")) button.textContent = "Checking public form…"; else if (name.startsWith("questions-")) button.textContent = button.dataset.action === "search-choices" ? "Searching choices…" : "Reading form…"; }
     try {
       const result = await task();
       await refresh(true);
@@ -261,6 +262,49 @@
       return `<div class="job-fact ${key === "location" ? "fact-location" : ""}"><dt>${escape(label)}</dt><dd class="${fact.status === "not_stated" || summary === "Not listed" ? "not-listed" : ""}">${escape(summary)}</dd></div>`;
     }).join("")}</dl>`;
   }
+  function platformMode(support) {
+    if (!support || typeof support !== "object") return {label:"Support not checked",className:"unknown"};
+    if (support.automatic_submission_supported === true && ["lever","greenhouse"].includes(support.platform)) return {label:"Automatic applications",className:"automatic"};
+    return support.can_inspect === true ? {label:"Read-only check · manual application",className:"inspection"} : {label:"Manual application",className:"manual"};
+  }
+  function canCheckPlatform(job) {
+    return !isDemo(job) && job.platform_support?.can_inspect === true && job.platform_check_available !== false && job.closed !== true && !job.attempted_at && !(Number(job.attempts) > 0) && ["new","queued","needs_attention","needs_review","manual_review","held","ineligible","failed"].includes(String(job.status || "new").toLowerCase());
+  }
+  function platformReportMarkup(report) {
+    if (!report || typeof report !== "object") return "";
+    const fields = list(report.fields).slice(0,100);
+    const gates = list(report.gates);
+    const observed = Number.isInteger(report.field_count) && report.field_count >= 0 ? report.field_count : fields.length;
+    const stage = String(report.stage || "unknown").replaceAll("_"," ");
+    return `<section class="platform-report" aria-label="Last read-only platform check"><div class="platform-report-heading"><strong>Last read-only platform check</strong><span>${escape(fullDate(report.checked_at))}</span></div><p class="platform-stage">Observed stage: <strong>${escape(stage)}</strong></p>${report.message ? `<p>${escape(report.message)}</p>` : ""}${gates.length ? `<ul class="platform-gates">${gates.map(gate => `<li><strong>${escape(String(gate.kind || "Review").replaceAll("_"," "))}</strong> · ${escape(gate.message || "Review this step on the employer site.")}</li>`).join("")}</ul>` : '<p class="platform-check-note">No access gate was observed during this check. Later steps may still need review.</p>'}<details class="platform-fields"><summary>${observed} observed field${observed === 1 ? "" : "s"}${observed > fields.length ? ` · showing ${fields.length}` : ""}</summary>${fields.length ? `<ul>${fields.map(field => `<li><strong>${escape(field.label || "Unlabelled field")}</strong><span>${escape(field.type || "unknown control")} · ${field.required === true ? "Required" : "Optional"}</span>${list(field.options).length ? `<p>Observed choices: ${list(field.options).slice(0,100).map(option => escape(typeof option === "object" && option !== null ? option.label || option.value || "Unlabelled choice" : option)).join(" · ")}${list(field.options).length > 100 ? " · Additional choices omitted" : ""}</p>` : ""}</li>`).join("")}</ul>` : '<p>No form fields were observed on this page.</p>'}</details>${report.next_action ? `<p class="platform-next-action"><strong>Next step</strong> ${escape(report.next_action)}</p>` : ""}<p class="platform-check-note">This check does not fill fields, upload your resume, submit an application or approve your settings.</p></section>`;
+  }
+  function jobPlatformMarkup(job) {
+    if (isDemo(job)) return "";
+    const support = job.platform_support;
+    const mode = platformMode(support);
+    return `<section class="job-platform-support" aria-label="Application platform compatibility"><div class="platform-support-heading"><span class="detail-label">${escape(support?.label || String(job.ats || "Unknown platform"))}</span><span class="platform-mode ${mode.className}">${mode.label}</span></div><p>${escape(support?.reason || "Platform compatibility has not been reported. Open the employer form to review it.")}</p>${support?.next_action ? `<p class="platform-next-action">${escape(support.next_action)}</p>` : ""}${platformReportMarkup(job.platform_check)}</section>`;
+  }
+  function platformCatalogMarkup(platforms) {
+    const entries = list(platforms);
+    if (!entries.length) return '<p class="platform-check-note">Platform compatibility will appear after the local server returns its support list.</p>';
+    const automatic = entries.filter(item => platformMode(item).className === "automatic").length;
+    const inspectable = entries.filter(item => platformMode(item).className === "inspection").length;
+    return `<details class="platform-catalog"><summary>${automatic} automatic · ${inspectable} inspection-only · ${entries.length - automatic - inspectable} manual <span>View platform details</span></summary><ul>${entries.map(item => {
+      const mode = platformMode(item);
+      return `<li><div><strong>${escape(item.label || item.platform || "Unknown platform")}</strong><span class="platform-mode ${mode.className}">${mode.label}</span></div><p>${escape(item.reason || "Open the employer form for manual review.")}</p>${item.next_action ? `<p class="platform-next-action">${escape(item.next_action)}</p>` : ""}</li>`;
+    }).join("")}</ul></details>`;
+  }
+  function renderPlatforms() {
+    const target = $("#platform-support-list");
+    if (!target) return;
+    const signature = JSON.stringify(list(state.platforms));
+    if (signature === lastPlatformSignature) return;
+    const wasOpen = target.querySelector?.(".platform-catalog")?.open === true;
+    target.innerHTML = platformCatalogMarkup(state.platforms);
+    const details = target.querySelector?.(".platform-catalog");
+    if (details) details.open = wasOpen;
+    lastPlatformSignature = signature;
+  }
   function jobCard(job) {
     const id = String(job.id);
     const score = job.score !== null && job.score !== undefined && Number.isFinite(Number(job.score)) ? Math.round(Number(job.score)) : null;
@@ -297,9 +341,9 @@
       ${!isDemo(job) ? jobFactsMarkup(job) : ""}
       <div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.matches_rules === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "Checks & details"}${icon("chevron")}</button></div>
       ${quickActions}${observed}
-      <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${preflight}
+      <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${jobPlatformMarkup(job)}${preflight}
         <details class="fit-explanation"><summary>Score evidence & eligibility</summary><div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${sourceEvidence.length ? `<div class="detail-label">Job fact source excerpts</div>${evidence([...new Set(sourceEvidence)])}` : ""}</details>
-        ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${canRefreshQuestions ? `<button type="button" class="button button-secondary" data-action="refresh-questions" data-id="${escape(id)}">Refresh form questions</button>` : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
+        ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${canCheckPlatform(job) ? `<button type="button" class="button button-secondary" data-action="check-platform" data-id="${escape(id)}">Check platform</button>` : ""}${canRefreshQuestions ? `<button type="button" class="button button-secondary" data-action="refresh-questions" data-id="${escape(id)}">Refresh form questions</button>` : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
   function renderReadiness() {
     const profileReady = Boolean(state.profile?.name && state.profile?.email);
@@ -931,6 +975,7 @@
     renderSummary();
     renderControls();
     renderReadiness();
+    renderPlatforms();
     renderJobs();
     renderAnswerMemory();
     renderActivity();
@@ -1075,6 +1120,11 @@
     } else if (name === "refresh-questions") {
       const form = button.closest(".activity-answer-form");
       action(`questions-${id}`,button,() => form ? post(`/api/jobs/${encodeURIComponent(id)}/questions/options`,{question:form.dataset.question,query:""}) : post(`/api/jobs/${encodeURIComponent(id)}/questions/refresh`),result => result.message);
+    } else if (name === "check-platform") {
+      const job = list(state.jobs).find(item => String(item.id) === id);
+      if (!job || !canCheckPlatform(job)) { showNotice("This role cannot be checked in its current state. Refresh its recorded status.",true); return; }
+      expanded.add(id);
+      action(`platform-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/platform/check`),"Read-only platform check completed. Review the observed stage and next step in the role details; nothing was submitted.");
     } else if (name === "search-choices") {
       const form = button.closest(".activity-answer-form");
       const query = form?.elements.lookup_query?.value.trim();

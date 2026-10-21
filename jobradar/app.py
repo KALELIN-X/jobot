@@ -27,6 +27,7 @@ from .job_facts import job_facts
 from .store import Store, application_key, now
 from .run_status import RunTracker
 from .onboarding import onboarding_state, profile_revision, register_onboarding_routes
+from .platforms import platform_catalog, platform_support
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_RESUME_BYTES = 5 * 1024 * 1024
@@ -59,6 +60,24 @@ def create_app(data_dir: Path | None = None):
 
     def worker_busy():
         return state["running"] or state["demo_running"] or bool(state["task"] and not state["task"].done())
+
+    def platform_check_problem(job):
+        from .destinations import SIMPLIFY_SOURCE_URL
+        protected = {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere", "dismissed"}
+        if job.get("demo") or job.get("attempted_at") or job["status"] in protected or store.destination_attempted(job):
+            return "Only an unattempted available role can run a public platform check."
+        support = platform_support(job)
+        if not support["can_inspect"]:
+            return support["reason"]
+        if job.get("closed") is True:
+            return "The saved posting is closed. Refresh it before inspecting its form."
+        if support["automatic_submission_supported"]:
+            if not verified_destination(job):
+                return "Refresh the verified employer link before inspecting its form."
+        elif (job.get("source") != "SimplifyJobs" or job.get("source_url") != SIMPLIFY_SOURCE_URL
+              or not isinstance(job.get("source_listing"), dict)):
+            return "A source-published job link is required for public inspection. Fetch this posting before checking its platform."
+        return None
 
     def configuration_problems(profile, rules, resume):
         problems = setup_problems(profile, rules, resume)
@@ -557,6 +576,8 @@ def create_app(data_dir: Path | None = None):
         selected = selected_destinations(jobs)
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
+            job["platform_support"] = platform_support(job)
+            job["platform_check_available"] = platform_check_problem(job) is None
             job["submission_check"] = submission_check(job, rules, profile)
             job["queue_actions"] = queue_actions(job, selected)
             job["unanswered_question_count"], job["conflicting_answer_count"] = unanswered_question_counts(job, profile)
@@ -572,6 +593,7 @@ def create_app(data_dir: Path | None = None):
             "profile": profile, "profile_revision": profile_revision(profile), "rules": rules,
             "onboarding": onboarding_state(profile, resume)["completion"],
             "review_actions": application_review_actions(jobs),
+            "platforms": platform_catalog(),
             "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")},
             "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"),
                          "candidate_fingerprint": fingerprint(profile, rules, resume)},
@@ -668,6 +690,42 @@ def create_app(data_dir: Path | None = None):
     @app.post("/api/jobs/{job_id}/questions/options")
     async def lookup_question(job_id: str, body: QuestionLookupRequest):
         return await refresh_form_questions(job_id, question=body.question, query=body.query)
+
+    @app.post("/api/jobs/{job_id}/platform/check")
+    async def check_platform(job_id: str):
+        from .platform_checks import inspect_public_platform
+        from .question_lookup import inspect_questions
+
+        job = store.job(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found.")
+        support = platform_support(job)
+        problem = platform_check_problem(job)
+        if problem:
+            raise HTTPException(409, problem)
+        if worker_busy() or state["fetching"] or question_lock.locked():
+            raise HTTPException(409, "Wait for the active application, fetch or public check to finish.")
+        async with question_lock:
+            public_job = {"apply_url": job.get("apply_url")}
+            if support["automatic_submission_supported"]:
+                inspected = await inspect_questions(public_job)
+                from .platform_checks import _report
+                report = _report({"stage": inspected.get("status", "unavailable"), "fields": inspected.get("fields", []),
+                                  "gates": [] if inspected.get("status") == "inspected" else [inspected.get("message", "The form could not be fully read.")]}, support)
+                # Inspection itself never authorizes an application, even when
+                # this provider also has a separate guarded worker adapter.
+                report["automatic_submission_supported"] = True
+            else:
+                from .platform_checks import _report
+                report = _report(await inspect_public_platform(public_job), support)
+            fresh = store.job(job_id)
+            if (fresh is None or fresh.get("apply_url") != job.get("apply_url") or fresh.get("attempted_at")
+                    or platform_check_problem(fresh)):
+                raise HTTPException(409, "The application changed during its public check. No result or queue change was saved.")
+            report["checked_at"] = now()
+            store.update_job(job_id, fresh["status"], platform_check=report)
+            store.event("platform_check", "Public platform check completed without applicant details, uploads or submission.", job_id)
+            return report
 
     @app.post("/api/profile")
     async def save_profile(profile: ProfileSaveRequest):

@@ -144,7 +144,7 @@ def parse_simplify_readme(document: str, limit: int = 100) -> list[dict]:
                "source": "SimplifyJobs", "source_url": SIMPLIFY_SOURCE_URL,
                "source_listing": {"company": company, "title": title["text"], "location": location_text},
                "detail_url": parsed["canonical_url"] if parsed else urls[0],
-               "apply_url": parsed["apply_url"] if parsed else urls[0], "ats": parsed["ats"] if parsed else "unsupported",
+               "apply_url": parsed["apply_url"] if parsed else urls[0], "ats": parsed["ats"] if parsed else ingest.classify_ats(urls[0]),
                "date_posted": _age_date(age["text"]), "date_posted_raw": age["text"],
                "description": "", "description_source": None, "requirements": [], "required_skills": [], "preferred_skills": [],
                "closed": None, "employer_verified": None, "fetch_error": None}

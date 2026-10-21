@@ -61,6 +61,7 @@ FACT_INTENTS = {
     "availability.offer_deadline": "has_offer_deadline", "availability.offer_deadline_date": "offer_deadline",
     "eligibility.adult": "age_18_or_older",
     "contact.postal_code": "postal_code", "contact.country": "current_country", "contact.state": "current_state",
+    "contact.city": "current_city",
     "availability.earliest_month": "earliest_start_month", "employer.current_employer_contact": "may_contact_current_employer",
 }
 ALIASES = {
@@ -70,7 +71,7 @@ ALIASES = {
     "identity.preferred_first_name": {"preferred first name", "preferredfirstname", "preferred given name"},
     "identity.preferred_full_name": {"preferred name", "preferred full name", "what name do you prefer to go by"},
     "identity.pronouns": {"pronouns", "preferred pronouns", "your pronouns", "what are your pronouns"},
-    "contact.email": {"email", "email address", "emailaddress", "your email"},
+    "contact.email": {"email", "email address", "emailaddress", "your email", "confirm email", "confirm your email", "confirm email address", "email confirmation", "re enter email", "re enter your email"},
     "contact.phone": {"phone", "phone number", "phonenumber", "telephone", "mobile phone", "mobile number"},
     "contact.location": {"location", "current location", "currentlocation", "location city", "city country", "location city country"},
     "employment.current_company": {"current company", "currentcompany", "current employer", "organization"},
@@ -87,6 +88,7 @@ ALIASES = {
     "contact.postal_code": {"postal code", "zip code", "zip postal code", "zip"},
     "contact.country": {"country", "current country", "country of residence"},
     "contact.state": {"state", "current state", "state province", "state of residence"},
+    "contact.city": {"city", "current city", "city of residence", "town city"},
     "availability.earliest_month": {"earliest start month", "earliest available start month"},
 }
 RECORD_INTENTS = {
