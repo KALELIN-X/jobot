@@ -106,10 +106,10 @@ def test_optional_unknown_fields_are_left_alone():
 
 
 def test_approved_custom_answers_require_exact_question_label():
-    profile = {"answers": {"Why this role?": "The candidate's approved answer."}}
-    assert plan_form([control("Why this role?")], profile).actions[0].value == profile["answers"]["Why this role?"]
-    assert plan_form([control("Why this company?")], profile).blockers
-    assert plan_form([control("why this role?")], profile).blockers
+    profile = {"answers": {"Preferred editor?": "The candidate's approved answer."}}
+    assert plan_form([control("Preferred editor?")], profile).actions[0].value == profile["answers"]["Preferred editor?"]
+    assert plan_form([control("Favorite editor?")], profile).blockers
+    assert plan_form([control("preferred editor?")], profile).blockers
 
 
 @pytest.mark.parametrize("label,kind,required", [

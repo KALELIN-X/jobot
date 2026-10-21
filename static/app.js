@@ -32,9 +32,19 @@
   let lastMemorySignature = "";
   const dirty = {profile:false,rules:false};
   const initialized = {profile:false,rules:false};
+  let profileEditorRevision = null;
   const expanded = new Set();
   const busyActions = new Set();
-  const viewNames = {queue:"Application queue",profile:"Profile & resume",rules:"Application rules",activity:"Activity"};
+  const viewNames = {queue:"Application queue",setup:"Application profile",profile:"Profile & resume",rules:"Application rules",activity:"Activity"};
+  let onboardingSnapshot = null;
+  let onboardingDraft = null;
+  let onboardingStep = 0;
+  let onboardingDirty = false;
+  let onboardingLoading = false;
+  let onboardingSaving = false;
+  let onboardingConflict = false;
+  let onboardingError = "";
+  let onboardingStarted = false;
   const attentionStatuses = new Set(["needs_attention","needs_review","review","failed","blocked","error","ineligible","manual_review","held","uncertain"]);
 
   function safeURL(value) {
@@ -84,7 +94,8 @@
   function errorMessage(data, fallback) {
     const detail = data?.detail ?? data?.error ?? data?.message;
     if (typeof detail === "string") return detail;
-    if (Array.isArray(detail)) return detail.map(item => typeof item === "string" ? item : item.msg || JSON.stringify(item)).join("; ");
+    if (Array.isArray(detail)) return detail.map(item => typeof item === "string" ? item : `${Array.isArray(item.loc) ? item.loc.filter(part => part !== "body").join(" → ")+": " : ""}${item.msg || "Invalid value"}`).join("; ");
+    if (detail && typeof detail === "object" && Array.isArray(detail.fields)) return `${detail.message || "Check your answers."} ${detail.fields.map(item => `${item.field}: ${item.message}`).join("; ")}`;
     return fallback;
   }
   async function api(path, options = {}) {
@@ -130,6 +141,10 @@
     $("#breadcrumb-current").textContent = viewNames[view];
     renderSummary(enteringRules);
     renderControls();
+    if (view === "setup") {
+      if (!onboardingSnapshot && !onboardingLoading) loadOnboarding();
+      else renderOnboarding();
+    }
     if (updateHash) {
       history.replaceState(null,"",`#${view}`);
       const heading = $(`#view-${view} h1`);
@@ -426,17 +441,209 @@
     const capture = job?.browser_capture_available ? `<a href="/api/jobs/${encodeURIComponent(job.id)}/screenshot" class="text-button" target="_blank" rel="noopener">View last browser capture ↗</a>` : "";
     $("#worker-content").innerHTML = `${run.active_job ? `<p class="worker-role">${escape(run.active_job.title)}</p>` : ""}<div class="worker-current-step">${icon("activity")}<strong>${escape(run.message || "Waiting for an observed worker step")}</strong></div><div class="worker-counts">${counts}<span>${run.processed ?? 0} / ${run.total ?? 0} selected roles processed</span><span>${run.submitted ?? 0} confirmed · ${run.needs_attention ?? 0} need review · ${run.failed ?? 0} failed · ${run.uncertain ?? 0} uncertain</span></div><p class="worker-sync">${connectionLost ? `Connection lost. Last server contact ${elapsedLabel(new Date(lastSyncAt).toISOString())}. This is a saved status, not proof that the worker is still running.` : `${view.active ? `Worker heartbeat ${escape(elapsedLabel(run.heartbeat_at))}. ` : ""}Last observed step ${escape(elapsedLabel(run.updated_at))}.`}</p>${run.status === "stopping" ? '<p class="worker-sync">Stopping before the next submission. An application already sent cannot be undone.</p>' : ""}${job?.error ? `<p class="worker-error">${escape(job.error)}</p>` : ""}${pending ? `<button type="button" class="button button-secondary" data-action="open-questions" data-id="${escape(job.id)}">Review ${pending} question${pending === 1 ? "" : "s"} in Activity</button>` : ""}${capture}<details class="worker-timeline" ${timelineOpen ? "open" : ""}><summary>Observed steps from this run</summary><ol>${timeline || '<li>No browser step has been reported yet.</li>'}</ol></details>`;
   }
+  function onboardingValue(snapshot, field) {
+    return field.storage === "profile" ? snapshot?.profile?.[field.key] : snapshot?.application_profile?.facts?.[field.key];
+  }
+  function onboardingOption(option) {
+    return typeof option === "object" && option !== null ? {value:option.value,label:option.label ?? option.value} : {value:option,label:option};
+  }
+  function onboardingTypedValue(field, value) {
+    if (["list","string_list","tags"].includes(field.type)) return splitLines(value);
+    if (value === "" || value == null) return field.storage === "profile" && ["text","email","tel","url","textarea"].includes(field.type) ? "" : null;
+    if (["boolean","bool"].includes(field.type)) return value === true || value === "true" ? true : value === false || value === "false" ? false : null;
+    if (["integer","number","decimal"].includes(field.type)) return Number(value);
+    return String(value).trim();
+  }
+  function onboardingPayload(snapshot, step, values, records = {}) {
+    const body = {step:step.id,expected_revision:snapshot.revision,profile_patch:{},facts:{}};
+    for (const field of list(step.fields)) {
+      const value = onboardingTypedValue(field,values[field.key]);
+      (field.storage === "profile" ? body.profile_patch : body.facts)[field.key] = value;
+    }
+    for (const key of ["education","employment","availability"]) if (Object.hasOwn(records,key)) body[key] = records[key];
+    if (step.id === "review") body.complete = true;
+    return body;
+  }
+  function onboardingDisplay(value) {
+    if (value === null || value === undefined || value === "" || Array.isArray(value) && !value.length) return "Not provided";
+    if (typeof value === "boolean") return value ? "Yes" : "No";
+    if (Array.isArray(value)) return value.join(", ");
+    return String(value);
+  }
+  function onboardingFieldDisplay(field, value) {
+    if (value !== null && value !== undefined && value !== "") {
+      const option=list(field?.options).map(onboardingOption).find(option => String(option.value) === String(value));
+      if (option) return String(option.label);
+    }
+    return onboardingDisplay(value);
+  }
+  function onboardingControl(field, value, prefix = "setup", attributes = "") {
+    const id = `${prefix}-${field.key}`;
+    const description = field.description ? `<span class="field-hint">${escape(field.description)}</span>` : "";
+    const examples = list(field.examples).length ? `<details class="setup-examples"><summary>Questions this can answer</summary><ul>${field.examples.map(example => `<li>${escape(example)}</li>`).join("")}</ul></details>` : "";
+    const common = `id="${escape(id)}" name="${escape(field.key)}" ${attributes} ${field.required ? "required" : ""} ${field.description ? `aria-describedby="${escape(id)}-help"` : ""}`;
+    let control;
+    if (["boolean","bool"].includes(field.type)) control = `<select ${common}><option value="">Not provided / ask me</option><option value="true" ${value === true || value === "true" ? "selected" : ""}>Yes</option><option value="false" ${value === false || value === "false" ? "selected" : ""}>No</option></select>`;
+    else if (list(field.options).length) control = `<select ${common}><option value="">Not provided / ask me</option>${field.options.map(raw => { const option=onboardingOption(raw); return `<option value="${escape(option.value)}" ${String(value ?? "") === String(option.value) ? "selected" : ""}>${escape(option.label)}</option>`; }).join("")}</select>`;
+    else if (["textarea","list","string_list","tags"].includes(field.type)) control = `<textarea ${common} rows="${field.type === "textarea" ? 3 : 2}" maxlength="4000">${escape(Array.isArray(value) ? value.join("\n") : value ?? "")}</textarea>`;
+    else {
+      const type = ["month","date","email","tel","url","number"].includes(field.type) ? field.type : ["integer","decimal"].includes(field.type) ? "number" : "text";
+      control = `<input ${common} type="${type}" value="${escape(value ?? "")}" ${type === "number" ? `step="${escape(field.step ?? (field.type === "integer" ? "1" : "any"))}"` : 'maxlength="1000"'} ${field.min !== undefined ? `min="${escape(field.min)}"` : ""} ${field.max !== undefined ? `max="${escape(field.max)}"` : ""}>`;
+    }
+    const provenance=field.confirmed_at ? `<p class="setup-fact-source">Confirmed by you · ${escape(fullDate(field.confirmed_at))}</p>` : "";
+    return `<div class="setup-field"><label class="field" for="${escape(id)}"><span>${escape(field.label || field.key)}</span><span id="${escape(id)}-help">${description}</span>${control}</label>${provenance}${examples}</div>`;
+  }
+  function onboardingRecordSections(step) {
+    return list(step.records || step.sections).filter(section => ["education","employment","availability"].includes(section.key || section.id));
+  }
+  function onboardingNewRecord(section, id) {
+    // Primary is a UI selection preference. Every biographical fact still
+    // starts unknown, including whether an employment record is current.
+    return {id,...Object.fromEntries(list(section.fields).map(field => [field.key,field.key === "primary_for_applications" ? false : null]))};
+  }
+  function onboardingFieldsMarkup(step, confirmed = {}) {
+    const fields=list(step.fields);
+    const essentials=new Set(["name","first_name","last_name","preferred_first_name","email","phone","location"]);
+    const render=items => items.map(field => onboardingControl({...field,confirmed_at:confirmed[field.storage === "facts" ? "facts."+field.key : field.key]},onboardingDraft.values[field.key])).join("");
+    if (step.id !== "identity") return `<div class="setup-field-grid">${render(fields)}</div>`;
+    const primary=fields.filter(field => essentials.has(field.key));
+    const optional=fields.filter(field => !essentials.has(field.key));
+    return `<div class="setup-field-grid">${render(primary)}</div>${optional.length ? `<details class="setup-additional-details"><summary>More identity & professional details <span>Optional · ${optional.length} fields</span></summary><p>Professional links, preferred full name, pronouns and additional contact facts. Unanswered fields stay unknown.</p><div class="setup-field-grid">${render(optional)}</div></details>` : ""}`;
+  }
+  function onboardingRecordCards(step) {
+    return onboardingRecordSections(step).map(section => {
+      const key = section.key || section.id;
+      const records = list(onboardingDraft?.records?.[key]);
+      return `<section class="setup-record-section"><div class="setup-record-heading"><div><h3>${escape(section.title || section.label || key)}</h3><p>${escape(section.description || "Add only records you can confirm. Dates may stay unknown.")}</p></div><button type="button" class="button button-secondary" data-setup-action="add-record" data-record="${key}">Add ${key === "education" ? "education" : key === "employment" ? "experience" : "availability"} +</button></div>${records.length ? records.map((record,index) => `<fieldset class="setup-record" data-record="${key}" data-index="${index}"><legend>${escape(section.item_label || (key === "education" ? "Education" : key === "employment" ? "Experience" : "Availability"))} ${index+1}</legend><div class="setup-record-actions"><button type="button" class="text-button" data-setup-action="remove-record" data-record="${key}" data-index="${index}">Remove this record</button></div><div class="setup-field-grid">${list(section.fields).map(field => onboardingControl(field,record[field.key],`setup-${key}-${index}`,`data-record-key="${key}" data-record-index="${index}"`)).join("")}</div></fieldset>`).join("") : `<p class="setup-record-empty">No ${escape(key)} records added. Leave this empty if you prefer to answer later.</p>`}</section>`;
+    }).join("");
+  }
+  function onboardingReview(snapshot) {
+    const profile = snapshot.application_profile || {};
+    const facts = list(snapshot.catalog).flatMap(step => list(step.fields).map(field => ({field,value:onboardingValue(snapshot,field)})));
+    const recordDefinitions=Object.fromEntries(list(snapshot.catalog).flatMap(step => onboardingRecordSections(step).map(section => [section.key || section.id,section.fields])));
+    return `<div class="setup-review-intro">${icon("check")}<div><strong>Your facts, in one place.</strong><p>Confirm what you know. An unanswered field stays unknown; Jobot will ask only when an application needs it.</p></div></div><dl class="setup-review-list">${facts.map(({field,value}) => `<div><dt>${escape(field.label)}</dt><dd class="${value == null || value === "" ? "is-unknown" : ""}">${escape(onboardingFieldDisplay(field,value))}</dd></div>`).join("")}</dl>${["education","employment","availability"].map(key => `<section class="setup-record-summary"><h3>${escape(key.charAt(0).toUpperCase()+key.slice(1))}</h3>${list(profile[key]).length ? list(profile[key]).map(record => `<p>${Object.entries(record).filter(([field,value]) => field !== "id" && value !== null && value !== "").map(([field,value]) => `<span>${escape(field.replaceAll("_"," "))}: ${escape(onboardingFieldDisplay(list(recordDefinitions[key]).find(item => item.key === field),value))}</span>`).join(" · ")}</p>`).join("") : '<p class="muted">Not provided</p>'}</section>`).join("")}<p class="setup-review-note">This saves your application profile. It does not approve a queue or submit an application. Required agreements, verification challenges, conflicting facts, and unsupported forms still pause for review.</p>`;
+  }
+  function beginOnboardingStep(index) {
+    const catalog = list(onboardingSnapshot?.catalog);
+    onboardingStep = Math.max(0,Math.min(index,catalog.length-1));
+    const step = catalog[onboardingStep];
+    if (!step) return;
+    onboardingDraft = {values:Object.fromEntries(list(step.fields).map(field => [field.key,onboardingValue(onboardingSnapshot,field) ?? ""])),records:{}};
+    for (const section of onboardingRecordSections(step)) {
+      const key=section.key || section.id;
+      onboardingDraft.records[key]=JSON.parse(JSON.stringify(list(onboardingSnapshot.application_profile?.[key])));
+    }
+    onboardingDirty=false;
+    onboardingConflict=false;
+    onboardingError="";
+    renderOnboarding();
+  }
+  function renderOnboarding() {
+    const catalog = list(onboardingSnapshot?.catalog);
+    const completion=onboardingSnapshot?.completion || {};
+    const completed=list(completion.completed_steps || onboardingSnapshot?.application_profile?.completed_steps);
+    const total=catalog.length || completion.total_steps || 6;
+    const done=Math.min(total,completed.length);
+    $("#setup-progress-label").textContent=completion.complete ? "Application profile ready" : "Build your application profile";
+    $("#setup-progress-count").textContent=`${done}/${total} saved`;
+    $("#setup-progress-fill").style.width=`${done/total*100}%`;
+    $("#nav-setup-progress").textContent=`${done}/${total}`;
+    $("#nav-setup-progress").hidden=!onboardingSnapshot;
+    $("#setup-banner").hidden=!onboardingSnapshot || completion.complete===true;
+    $("#setup-banner-copy").textContent=`${done} of ${total} steps saved. Confirm common facts once, then reuse them across supported question wording.`;
+    $("#setup-error").hidden=!onboardingError;
+    $("#setup-error").innerHTML=onboardingError ? `<p>${escape(onboardingError)}</p>${onboardingConflict ? '<button type="button" class="button button-secondary" data-setup-action="reload">Reload saved answers (discard this unsaved step)</button>' : !onboardingSnapshot ? '<button type="button" class="text-button" data-setup-action="retry">Try loading again</button>' : '<p>Your draft is still here. Correct the issue described above, then save again.</p>'}` : "";
+    if (!onboardingSnapshot) return;
+    const step=catalog[onboardingStep];
+    if (!step || !onboardingDraft) return;
+    $("#setup-step-list").innerHTML=catalog.map((item,index) => `<button type="button" data-setup-action="step" data-step="${index}" class="setup-step ${index===onboardingStep ? "active" : ""}" ${index===onboardingStep ? 'aria-current="step"' : ""} ${onboardingSaving ? "disabled" : ""}><span class="setup-step-number ${completed.includes(item.id) ? "saved" : ""}">${completed.includes(item.id) ? icon("check") : index+1}</span><span><strong>${escape(item.title)}</strong><small>${completed.includes(item.id) ? "Saved · edit anytime" : "Not saved yet"}</small></span></button>`).join("");
+    const confirmed=onboardingSnapshot.application_profile?.confirmed_at || {};
+    const sourceText=list(step.fields).some(field => confirmed[field.storage === "facts" ? "facts."+field.key : field.key]) ? "Saved by you. Review and update whenever your situation changes." : "Only answers you save here become reusable facts.";
+    $("#setup-step-content").innerHTML=`<div class="setup-step-eyebrow">STEP ${onboardingStep+1} OF ${total}<span id="setup-draft-status" ${onboardingDirty ? "" : "hidden"}>Unsaved changes</span></div><h2 id="setup-step-title" tabindex="-1">${escape(step.title)}</h2><p class="setup-step-description">${escape(step.description || "Add facts you want Jobot to use on applications.")}</p><form id="onboarding-form" novalidate>${onboardingFieldsMarkup(step,confirmed)}${onboardingRecordCards(step)}${step.id === "identity" ? '<div class="setup-resume-link">'+icon("briefcase")+'<p>Your resume is managed separately. <button type="button" class="text-button" data-view="profile">Upload or review your resume →</button></p></div>' : ""}${step.id === "review" ? onboardingReview(onboardingSnapshot) : `<p class="setup-reuse-note">${icon("check")}<span>${escape(sourceText)} Unknown answers are never turned into “No.”</span></p>`}<div class="setup-form-footer"><button type="button" class="button button-secondary" data-setup-action="back" ${onboardingStep===0 || onboardingSaving ? "disabled" : ""}>← Back</button><div><button type="button" class="text-button" data-setup-action="skip" ${onboardingSaving ? "disabled" : ""}>${onboardingStep===catalog.length-1 ? "Back to queue" : "Answer later"}</button><button type="submit" class="button button-primary" ${onboardingSaving || onboardingConflict ? "disabled" : ""}>${onboardingSaving ? "Saving…" : step.id === "review" ? "Confirm application profile" : "Save & continue"}${icon("arrow")}</button></div></div></form>`;
+    if (onboardingSaving) {
+      $("#onboarding-form").setAttribute("aria-busy","true");
+      $$("input,select,textarea,button",$("#onboarding-form")).forEach(control => {control.disabled=true;});
+    }
+  }
+  async function loadOnboarding(force = false) {
+    if (onboardingLoading || onboardingDirty && !force) return;
+    onboardingLoading=true;
+    try {
+      onboardingSnapshot=await api("/api/onboarding");
+      const catalog=list(onboardingSnapshot.catalog);
+      const completed=list(onboardingSnapshot.completion?.completed_steps);
+      const first=Math.max(0,catalog.findIndex(step => !completed.includes(step.id)));
+      beginOnboardingStep(force ? onboardingStep : first);
+      if (!onboardingStarted) {
+        onboardingStarted=true;
+        const empty=!state.profile?.name && !state.profile?.email && !state.resume?.loaded && !list(state.jobs).length;
+        if (empty && (!location.hash || location.hash==="#queue")) setView("setup");
+      }
+    } catch(error) {
+      onboardingError=error.message || "Could not load your saved application profile.";
+      renderOnboarding();
+    } finally {onboardingLoading=false;}
+  }
+  async function saveOnboarding() {
+    if (onboardingSaving || onboardingConflict || !onboardingSnapshot) return;
+    const form=$("#onboarding-form");
+    if (!form.reportValidity()) return;
+    const step=list(onboardingSnapshot.catalog)[onboardingStep];
+    const body=onboardingPayload(onboardingSnapshot,step,onboardingDraft.values,onboardingDraft.records);
+    onboardingSaving=true;
+    onboardingError="";
+    renderOnboarding();
+    try {
+      onboardingSnapshot=await post("/api/onboarding",body);
+      onboardingDirty=false;
+      await refresh(true);
+      if (step.id === "review") {beginOnboardingStep(onboardingStep);setView("rules");showNotice("Application profile confirmed. Review your search rules and authorize the queue when ready.");}
+      else beginOnboardingStep(onboardingStep+1);
+    } catch(error) {
+      onboardingError=error.message || "Your answers could not be saved. Your draft is still here.";
+      onboardingConflict=/changed|stale|revision|conflict/i.test(onboardingError);
+    } finally {
+      onboardingSaving=false;
+      renderOnboarding();
+      if (onboardingError) $("#setup-error").scrollIntoView({block:"start",behavior:"smooth"});
+      else if (currentView === "setup") {$("#setup-step-title").focus({preventScroll:true});$("#view-setup").scrollIntoView({block:"start",behavior:"smooth"});}
+    }
+  }
   function answerContext(saved) {
     const sources = list(saved.sources);
-    const source = sources.find(item => item.job_id === questionSources.get(saved.question)) || sources[0];
+    const selection=questionSources.get(savedAnswerIdentity(saved)) ?? (!saved.scope ? questionSources.get(saved.question) : undefined);
+    const source = sources.find(item => item.job_id === selection) || sources[0];
     return source ? {...saved,...source,question:saved.question,answer:saved.answer} : null;
   }
-  function recordedQuestion(jobId, question) {
+  function savedAnswerIdentity(item) {
+    return JSON.stringify([item.question,item.scope || "legacy",item.company || "",item.job_id || "",item.intent_id || ""]);
+  }
+  function recordedQuestion(jobId, question, bindingKey = null) {
+    if (bindingKey) {
+      const saved=list(state.answer_memory?.saved).find(item => savedAnswerIdentity(item) === bindingKey);
+      const source=list(saved?.sources).find(item => item.job_id === jobId);
+      return saved && source && saved.question === question ? {...saved,...source,question:saved.question,answer:saved.answer} : null;
+    }
     return list(state.answer_memory?.pending).find(item => item.job_id === jobId && item.question === question)
       || list(state.answer_memory?.saved).flatMap(saved => list(saved.sources).map(source => ({...saved,...source,question:saved.question}))).find(item => item.job_id === jobId && item.question === question);
   }
+  function questionIntentLabel(intent) {
+    const labels={"eligibility.work_authorized_us":"U.S. work authorization","eligibility.sponsorship_us":"Sponsorship now or in the future","eligibility.sponsorship_now_us":"Current sponsorship","eligibility.sponsorship_future_us":"Future sponsorship","eligibility.us_citizen":"U.S. citizenship","experience.months":"Professional experience in months","experience.completed_internships":"Completed internships","compensation.target_base":"Base salary target","availability.immediate":"Immediate availability","availability.full_time_after_internship":"Full-time work after an internship","history.nda":"Nondisclosure agreements","history.employment_restrictions":"Employment restrictions","location.self_funded_relocation":"Relocation at your own expense"};
+    return labels[intent] || String(intent || "Common question").split(".").at(-1).replaceAll("_"," ");
+  }
+  function answerSourceLabel(source) {
+    if (!source) return "";
+    if (typeof source === "object") return source.label || "Confirmed profile answer";
+    if (source.includes("saved_answer_bindings") || source.includes("answers")) return "Answer you previously confirmed";
+    if (source.includes("education")) return "Your saved education record";
+    if (source.includes("employment")) return "Your saved work history";
+    if (source.includes("availability")) return "Your confirmed availability";
+    if (source.includes("application_profile")) return "Your common application profile";
+    return "Your saved profile";
+  }
   function questionCard(item, saved = null) {
-    const key = `${item.job_id}:${item.question}`;
+    const bindingKey=saved ? savedAnswerIdentity(saved) : "";
+    const key = saved?.scope ? `${bindingKey}:${item.job_id}` : `${item.job_id}:${item.question}`;
     const signature = JSON.stringify([item.type,item.options]);
     const draft = questionDrafts.get(key);
     const options = item.type === "checkbox" ? [{label:"Yes",value:true},{label:"No",value:false}] : list(item.options);
@@ -454,27 +661,64 @@
     else if (options.length && options.length <= 6) controls = `<fieldset class="question-options"><legend>Choose your answer</legend>${options.map((option,index) => `<label><input type="radio" name="choice" value="${index}" ${value === String(index) ? "checked" : ""} required><span>${escape(option.label)}</span></label>`).join("")}</fieldset>`;
     else if (options.length) controls = `<label class="field">Your answer<select name="choice" required><option value="">Choose an available answer</option>${options.map((option,index) => `<option value="${index}" ${value === String(index) ? "selected" : ""}>${escape(option.label)}</option>`).join("")}</select></label>`;
     else controls = `<label class="field">Your answer<textarea name="answer" rows="2" maxlength="4000" required>${escape(draft?.signature === signature ? draft.value : saved?.answer ?? "")}</textarea></label>`;
-    const context = saved && list(saved.sources).length > 1 ? `<label class="field">Application choices<select name="question_source" data-question="${escape(item.question)}">${saved.sources.map(source => `<option value="${escape(source.job_id)}" ${source.job_id === item.job_id ? "selected" : ""}>${escape(source.company)} · ${escape(source.title)}</option>`).join("")}</select></label>` : "";
-    return `<form class="activity-answer-form" data-job-id="${escape(item.job_id)}" data-question="${escape(item.question)}" data-options-signature="${escape(signature)}"><div class="answer-context">${escape(item.company)} · ${escape(item.title)} · ${item.required ? "Required" : "Optional"}</div><h3>${escape(item.question)}</h3>${context}${searchControl}${controls}<div class="question-editor-actions">${!unavailable ? `<button type="submit" class="button button-primary">Confirm &amp; remember answer ${icon("check")}</button>` : ""}<button type="button" class="text-button" data-action="refresh-questions" data-id="${escape(item.job_id)}">Refresh form choices</button>${unavailable ? externalLink(list(state.jobs).find(job => job.id === item.job_id)?.apply_url,"Open employer form") : ""}</div><p class="field-hint">Only confirming changes your saved answer. Review the updated approval before running; refreshing or searching never submits an application.</p></form>`;
+    const context = saved && list(saved.sources).length > 1 ? `<label class="field">Application choices<select name="question_source" data-question="${escape(item.question)}" data-answer-key="${escape(bindingKey)}">${saved.sources.map(source => `<option value="${escape(source.job_id)}" ${source.job_id === item.job_id ? "selected" : ""}>${escape(source.company)} · ${escape(source.title)}</option>`).join("")}</select></label>` : "";
+    const scope=draft?.scope || saved?.scope || (item.intent_id && item.scope !== "employer" && item.scope !== "application" ? "global" : item.job_id ? "application" : "global");
+    const employerOnly=item.scope === "employer" || item.scope === "application";
+    const scopeControl=!unavailable ? `<label class="field question-scope">Reuse this answer<select name="answer_scope"><option value="application" ${scope==="application" ? "selected" : ""}>Only this application</option><option value="employer" ${scope==="employer" ? "selected" : ""}>Only this employer</option>${!employerOnly ? `<option value="global" ${scope==="global" ? "selected" : ""}>${item.intent_id ? "Common fact across supported wording" : "Across employers for the same question"}</option>` : ""}</select></label>${item.intent_id && !employerOnly ? `<p class="question-group-context">Common fact: <strong>${escape(questionIntentLabel(item.intent_id))}</strong>. Confirming with common-fact reuse saves this value to your application profile. Choose a narrower scope if the answer is specific to this employer or application.</p>` : ""}` : "";
+    const job=list(state.jobs).find(job => job.id === item.job_id);
+    const canContinue=!unavailable && item.job_id && state.approval?.approved === true && state.approval?.candidate_fingerprint && job && !job.attempted_at && !["submitted","applied_elsewhere","uncertain","active","filling","submitting","applying"].includes(job.status);
+    const source=item.answer_source ? `<p class="question-group-context">Answer source: ${escape(answerSourceLabel(item.answer_source))}</p>` : "";
+    return `<form class="activity-answer-form" data-job-id="${escape(item.job_id)}" data-question="${escape(item.question)}" data-binding-key="${escape(bindingKey)}" data-draft-key="${escape(key)}" data-options-signature="${escape(signature)}"><div class="answer-context">${escape(item.company)} · ${escape(item.title)} · ${item.required ? "Required" : "Optional"}</div><h3>${escape(item.question)}</h3>${source}${context}${searchControl}${controls}${scopeControl}<div class="question-editor-actions">${!unavailable ? `<button type="submit" name="intent" value="save" class="button button-primary">Confirm &amp; remember answer ${icon("check")}</button>${canContinue ? '<button type="submit" name="intent" value="continue" class="button button-secondary">Confirm &amp; run approved queue</button>' : ""}` : ""}<button type="button" class="text-button" data-action="refresh-questions" data-id="${escape(item.job_id)}">Refresh form choices</button>${unavailable ? externalLink(job?.apply_url,"Open employer form") : ""}</div><p class="field-hint">${canContinue ? "Confirming saves the answer in the selected scope. “Confirm & run” adds this answer to your already approved profile and rules, then starts a one-time queue run. Scheduling stays off." : "Save the answer, then review the updated application settings before running."} Searching or refreshing never submits an application.</p></form>`;
+  }
+  function groupedQuestionCards(pending) {
+    const groups=list(state.answer_memory?.groups);
+    if (!groups.length) return pending.map(item => questionCard(item)).join("");
+    const visible=new Set(pending.map(item => `${item.job_id}:${item.question}`));
+    const included=new Set();
+    const html=groups.map(group => {
+      const questions=list(group.questions).filter(item => visible.has(`${item.job_id}:${item.question}`));
+      if (!questions.length) return "";
+      const primary=questions[0];
+      // Choice menus belong to individual forms. Group wording without ever
+      // borrowing another employer's options or confirming their answers.
+      const sameText=questions.every(item => !["select","radio","checkbox"].includes(item.type)) && questions.length>1;
+      const cards=sameText ? [primary] : questions;
+      questions.forEach(item => included.add(`${item.job_id}:${item.question}`));
+      return `<section class="question-group">${questions.length>1 ? `<p class="question-group-context">${questions.length} related questions · ${escape(group.intent_id ? questionIntentLabel(group.intent_id) : "Same question")}. ${sameText ? "Confirm a common fact to reuse it across supported wording. An application-scoped answer only resolves the form shown below." : "Each form keeps its own actual choices."}</p>` : ""}${cards.map(item => questionCard(item)).join("")}${sameText ? `<details><summary>See the original questions and employers</summary><ul>${questions.map(item => `<li>${escape(item.company)}: ${escape(item.question)}</li>`).join("")}</ul></details>` : ""}</section>`;
+    }).join("");
+    return html+pending.filter(item => !included.has(`${item.job_id}:${item.question}`)).map(item => questionCard(item)).join("");
+  }
+  function reviewActionCards(actions) {
+    const labels={agreement:"Review an agreement",captcha:"Complete verification",login:"Sign in on the employer site",form:"Review the employer form",uncertain:"Check whether it was received"};
+    const descriptions={agreement:"Review the employer's actual terms before accepting. An answer saved in Jobot does not accept an agreement.",captcha:"Complete the challenge on the employer site. Jobot does not bypass verification.",login:"Continue in your employer account. Passwords and verification codes are not saved in your answer profile.",form:"The form needs an action that this adapter cannot complete automatically.",uncertain:"A submission may already have reached the employer. Verify its status before any further action; Jobot will not automatically retry."};
+    return list(actions).map(item => `<article class="site-action-card" data-job-id="${escape(item.job_id)}"><div class="site-action-symbol">${icon(item.kind === "uncertain" ? "info" : "lock")}</div><div class="site-action-copy"><div class="answer-context">${escape(item.company)} · ${escape(item.title)}</div><h3>${escape(labels[item.kind] || labels.form)}</h3><p class="site-action-reason">${escape(item.message || "This application needs your review on the employer site.")}</p><p>${escape(descriptions[item.kind] || descriptions.form)}</p></div><div class="site-action-link">${externalLink(item.apply_url,item.kind === "uncertain" ? "Check employer status" : "Open employer form")}</div></article>`).join("");
+  }
+  function renderReviewActions() {
+    const actions=list(state.review_actions);
+    $("#activity-site-actions").hidden=!actions.length;
+    $("#site-action-count").textContent=actions.length;
+    $("#site-action-list").innerHTML=reviewActionCards(actions);
   }
   function renderActivityQuestions() {
     const pending = list(state.answer_memory?.pending);
     const saved = list(state.answer_memory?.saved);
-    const signature = JSON.stringify([pending,saved,[...questionSources]]);
+    const signature = JSON.stringify([pending,saved,state.answer_memory?.groups,state.review_actions,state.approval?.approved,state.approval?.candidate_fingerprint,list(state.jobs).map(job => [job.id,job.status,job.attempted_at]),[...questionSources]]);
     if (signature === lastInboxSignature) return;
     lastInboxSignature = signature;
-    $("#nav-activity-questions").textContent = pending.length;
-    $("#nav-activity-questions").hidden = !pending.length;
+    const attentionCount=pending.length+list(state.review_actions).length;
+    $("#nav-activity-questions").textContent = attentionCount;
+    $("#nav-activity-questions").hidden = !attentionCount;
     const optionalOpen = $("#activity-question-list details")?.open === true;
-    const openSaved = new Set($$("#rules-answer-list .saved-answer-editor[open]").map(node => node.querySelector("form")?.dataset.question));
+    const openSaved = new Set($$("#rules-answer-list .saved-answer-editor[open]").map(node => node.dataset.bindingKey));
     const required = pending.filter(item => item.required);
     const optional = pending.filter(item => !item.required);
     $("#activity-question-count").textContent = `${required.length} required · ${optional.length} optional`;
-    $("#activity-question-list").innerHTML = pending.length ? required.map(item => questionCard(item)).join("") + (optional.length ? `<details class="optional-form-questions" ${optionalOpen ? "open" : ""}><summary>${optional.length} optional questions — you can leave these blank</summary>${optional.map(item => questionCard(item)).join("")}</details>` : "") : '<p class="answer-empty">No unanswered application questions. New questions appear when a form needs your input.</p>';
+    $("#activity-question-list").innerHTML = pending.length ? groupedQuestionCards(required) + (optional.length ? `<details class="optional-form-questions" ${optionalOpen ? "open" : ""}><summary>${optional.length} optional questions — you can leave these blank</summary>${groupedQuestionCards(optional)}</details>` : "") : '<p class="answer-empty">No unanswered application questions. New questions appear when a form needs your input.</p>';
     $("#activity-saved-answer-list").innerHTML = `<details class="saved-answer-review"><summary>Saved answers (${saved.length})</summary>${saved.map((item,index) => `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Review choices</button></div>`).join("")}</details>`;
     $("#rules-answer-list").innerHTML = saved.length ? saved.map((item,index) => {
       const observed = answerContext(item);
-      return observed ? `<details class="saved-answer-editor" ${openSaved.has(item.question) ? "open" : ""}><summary>${escape(item.question)}<span>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</span></summary>${questionCard(observed,item)}</details>` : `<div class="saved-question-row"><div><strong>${escape(item.question)}</strong><p>${escape(item.answer)}</p></div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button></div>`;
+      const identity=savedAnswerIdentity(item);
+      return observed ? `<details class="saved-answer-editor" data-binding-key="${escape(identity)}" ${openSaved.has(identity) ? "open" : ""}><summary>${escape(item.question)}<span>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}${item.company ? ` · ${escape(item.company)}` : ""}</span></summary>${questionCard(observed,item)}</details>` : `<div class="saved-question-row" data-binding-key="${escape(identity)}"><div><strong>${escape(item.question)}</strong><p>${escape(item.answer)}${item.company ? ` · ${escape(item.company)}` : ""}</p>${item.scope ? '<p class="field-hint">Refresh the original employer form before editing this scoped answer.</p>' : ""}</div><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button></div>`;
     }).join("") : '<p class="answer-empty">No confirmed answers yet. Answer employer questions in Activity as they appear.</p>';
   }
   function renderControls() {
@@ -536,8 +780,13 @@
     const applicantFields = [["Legal first name",profile.first_name],["Legal last name",profile.last_name],["Preferred name",profile.preferred_first_name],["Email",profile.email],["Phone",profile.phone],["Current location",profile.location],["Approved work locations",list(profile.approved_work_locations).join("; ")],["LinkedIn",profile.linkedin],["GitHub",profile.github],["Portfolio",profile.portfolio],["Skills",list(profile.skills).join(", ")],["Experience months",profile.experience_months],["Graduation",profile.graduation_date || profile.graduation_month],["Work authorized",profile.work_authorized == null ? "Not provided" : profile.work_authorized ? "Yes" : "No"],["Sponsorship needed",profile.needs_sponsorship == null ? "Not provided" : profile.needs_sponsorship ? "Yes" : "No"]];
     const applicantReview = applicantFields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value ?? "Not provided")}</strong></div>`).join("");
     const answerReview = Object.entries(profile.answers || {}).map(([question,answer]) => `<div class="approval-row"><span>${escape(question)}</span><strong>${escape(typeof answer === "boolean" ? answer ? "Yes" : "No" : answer)}</strong></div>`).join("");
+    const applicationProfile=profile.application_profile || {};
+    const factDefinitions=Object.fromEntries(list(onboardingSnapshot?.catalog).flatMap(step => list(step.fields).map(field => [field.key,field])));
+    const recordDefinitions=Object.fromEntries(list(onboardingSnapshot?.catalog).flatMap(step => onboardingRecordSections(step).map(section => [section.key || section.id,section.fields])));
+    const commonReview=Object.entries(applicationProfile.facts || {}).filter(([,value]) => value !== null && value !== "").map(([key,value]) => `<div class="approval-row"><span>${escape(factDefinitions[key]?.label || key.replaceAll("_"," "))}</span><strong>${escape(onboardingFieldDisplay(factDefinitions[key],value))}</strong></div>`).join("")+["education","employment","availability"].map(key => list(applicationProfile[key]).map(record => `<div class="approval-row"><span>${escape(key.charAt(0).toUpperCase()+key.slice(1))}</span><strong>${Object.entries(record).filter(([field,value]) => field !== "id" && value !== null && value !== "").map(([field,value]) => `${escape(field.replaceAll("_"," "))}: ${escape(onboardingFieldDisplay(list(recordDefinitions[key]).find(item => item.key === field),value))}`).join(" · ")}</strong></div>`).join("")).join("");
+    const bindingReview=list(applicationProfile.saved_answer_bindings).map(binding => `<div class="approval-row"><span>${escape(binding.question)}<small> · ${escape(binding.scope === "application" ? "This application" : binding.scope === "employer" ? binding.company || "This employer" : "Across employers")}</small></span><strong>${escape(onboardingDisplay(binding.answer))}</strong></div>`).join("");
     const stale = Boolean(approvalReview.fingerprint && approvalReview.fingerprint !== fingerprint);
-    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (selected && companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + `<details class="approval-companies"><summary>Applicant details</summary>${applicantReview}</details>` + `<details class="approval-companies"><summary>Reusable answers (${Object.keys(profile.answers || {}).length})</summary>${answerReview || "No saved reusable answers."}</details>` + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
+    $("#approval-summary").innerHTML = fields.map(([key,value]) => `<div class="approval-row"><span>${key}</span><strong>${escape(value)}</strong></div>`).join("") + (selected && companies.length ? `<div class="approval-companies">Companies: ${escape(companies.join(" · "))}</div>` : "") + `<details class="approval-companies"><summary>Applicant details</summary>${applicantReview}</details><details class="approval-companies"><summary>Common facts & history</summary>${commonReview || "No additional common facts saved."}</details>` + `<details class="approval-companies"><summary>Reusable answers (${Object.keys(profile.answers || {}).length+list(applicationProfile.saved_answer_bindings).length})</summary>${answerReview+bindingReview || "No saved reusable answers."}</details>` + `<div class="approval-companies">${stale ? "Saved configuration has changed. The details above have been preserved for your review." : "Review the saved details above before acknowledging."}</div><button type="button" class="text-button" data-action="review-refresh">Refresh saved review ${icon("refresh")}</button>`;
   }
   function renderAnswerMemory() {
     const memory = state.answer_memory || {pending:[],saved:Object.entries(state.profile?.answers || {}).map(([question,answer]) => ({question,answer}))};
@@ -550,7 +799,7 @@
     $("#pending-answer-count").textContent = pending.length;
     $("#nav-memory-count").textContent = pending.length || saved.length;
     $("#pending-answers").innerHTML = pending.length ? pending.map((item,index) => `<article class="answer-item"><div class="answer-context">${escape(item.company)} · ${escape(item.title)}${item.required ? " · Required" : " · Optional"}</div><h3>${escape(item.question)}</h3>${item.reason ? `<p>${escape(item.reason)}</p>` : ""}<button type="button" class="text-button" data-action="answer-question" data-index="${index}">Answer & remember →</button></article>`).join("") : '<p class="answer-empty">No new questions yet. When a supported form needs an unfamiliar answer, it will appear here.</p>';
-    $("#saved-answers").innerHTML = saved.length ? saved.map((item,index) => `<article class="answer-item saved-answer"><h3>${escape(item.question)}</h3><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p><div class="detail-actions"><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button><button type="button" class="text-button" data-action="forget-answer" data-index="${index}">Forget</button></div></article>`).join("") : '<p class="answer-empty">No reusable answers saved. Add one below or answer a question found during an application.</p>';
+    $("#saved-answers").innerHTML = saved.length ? saved.map((item,index) => `<article class="answer-item saved-answer">${item.scope ? `<div class="answer-context">${escape(item.scope === "application" ? "Only this application" : item.scope === "employer" ? `Only ${item.company || "this employer"}` : "Across employers")}${item.intent_id ? ` · ${escape(questionIntentLabel(item.intent_id))}` : ""}</div>` : ""}<h3>${escape(item.question)}</h3><p>${escape(typeof item.answer === "boolean" ? item.answer ? "Yes" : "No" : item.answer)}</p><div class="detail-actions"><button type="button" class="text-button" data-action="edit-answer" data-index="${index}">Edit answer</button><button type="button" class="text-button" data-action="forget-answer" data-index="${index}">Forget</button></div></article>`).join("") : '<p class="answer-empty">No reusable answers saved. Add one below or answer a question found during an application.</p>';
   }
   function resetAnswerForm() {
     const form = $("#answer-memory-form");
@@ -569,9 +818,16 @@
   }
   function editAnswer(item, pending = false) {
     const observed = pending ? item : answerContext(item);
-    if (observed && ["select","radio","checkbox"].includes(observed.type)) {
+    if (observed && (pending || item.scope || ["select","radio","checkbox"].includes(observed.type))) {
       if (pending) { setView("activity"); const form = [...document.querySelectorAll("#activity-question-list .activity-answer-form")].find(form => form.dataset.jobId === observed.job_id && form.dataset.question === observed.question); if (form?.closest("details")) form.closest("details").open=true; form?.scrollIntoView({block:"center",behavior:"smooth"}); }
-      else { setView("rules"); const details = [...document.querySelectorAll("#rules-answer-list .saved-answer-editor")].find(node => node.querySelector("form")?.dataset.question === item.question); if (details) { details.open=true; details.scrollIntoView({block:"center",behavior:"smooth"}); } }
+      else { setView("rules"); const details = [...document.querySelectorAll("#rules-answer-list .saved-answer-editor")].find(node => node.dataset.bindingKey === savedAnswerIdentity(item)); if (details) { details.open=true; details.scrollIntoView({block:"center",behavior:"smooth"}); } }
+      return;
+    }
+    if (item.scope) {
+      setView("rules");
+      const row=$$("#rules-answer-list [data-binding-key]").find(node => node.dataset.bindingKey === savedAnswerIdentity(item));
+      row?.scrollIntoView({block:"center",behavior:"smooth"});
+      showNotice("Refresh the original employer form's questions before editing this scoped answer. Its saved scope and answer have not changed.",true);
       return;
     }
     resetAnswerForm();
@@ -579,7 +835,7 @@
     const form = $("#answer-memory-form");
     form.elements.question.value = item.question;
     form.elements.question.readOnly = true;
-    form.elements.job_id.value = pending ? item.job_id : "";
+    form.elements.job_id.value = pending ? item.job_id : item.scope === "application" ? item.job_id || "" : "";
     form.dataset.kind = item.type || (typeof item.answer === "boolean" ? "checkbox" : "text");
     const choice = ["checkbox","radio","select"].includes(form.dataset.kind);
     if (choice) {
@@ -625,6 +881,7 @@
       profileForm.elements.skills.value = list(profile.skills).join("\n");
       profileForm.elements.approved_work_locations.value = list(profile.approved_work_locations).join("\n");
       profileForm.elements.answers.value = profile.answers && Object.keys(profile.answers).length ? JSON.stringify(profile.answers,null,2) : "";
+      profileEditorRevision = state.profile_revision || null;
       initialized.profile = true;
     }
     if (!dirty.rules && (!rulesForm.contains(document.activeElement) || !initialized.rules)) {
@@ -679,6 +936,7 @@
     renderActivity();
     renderProgress();
     renderActivityQuestions();
+    renderReviewActions();
   }
   function refresh(manual = false) {
     if (refreshing) return manual ? refreshInFlight.then(() => refresh(true)) : refreshInFlight;
@@ -694,6 +952,7 @@
         loaded = true;
         if (wasApproved && !state.approval?.approved) $("#approval-acknowledge").checked = false;
         renderState();
+        if (!onboardingStarted && !onboardingLoading) loadOnboarding();
         return true;
       } catch (error) {
         connectionLost = true;
@@ -719,24 +978,38 @@
     $("#approval-acknowledge").checked = false;
   }
   document.addEventListener("input",event => {
+    if (event.target.closest("#onboarding-form")) {
+      const step=list(onboardingSnapshot?.catalog)[onboardingStep];
+      const key=event.target.name;
+      if (event.target.dataset.recordKey) {
+        const recordKey=event.target.dataset.recordKey;
+        const section=onboardingRecordSections(step).find(item => (item.key || item.id)===recordKey);
+        const field=list(section?.fields).find(item => item.key===key);
+        if (field) onboardingDraft.records[recordKey][Number(event.target.dataset.recordIndex)][key]=onboardingTypedValue(field,event.target.value);
+      } else onboardingDraft.values[key]=event.target.value;
+      onboardingDirty=true;
+      $("#setup-draft-status").hidden=false;
+      return;
+    }
     const form = event.target.closest(".activity-answer-form");
     if (!form) return;
-    if (event.target.name === "lookup_query") { questionSearches.set(`${form.dataset.jobId}:${form.dataset.question}`,event.target.value); return; }
+    if (event.target.name === "lookup_query") { questionSearches.set(form.dataset.draftKey || `${form.dataset.jobId}:${form.dataset.question}`,event.target.value); return; }
     const value = form.elements.choice?.value ?? form.elements.answer?.value ?? "";
-    questionDrafts.set(`${form.dataset.jobId}:${form.dataset.question}`,{value,signature:form.dataset.optionsSignature});
+    questionDrafts.set(form.dataset.draftKey || `${form.dataset.jobId}:${form.dataset.question}`,{value,scope:form.elements.answer_scope?.value,signature:form.dataset.optionsSignature});
   });
   document.addEventListener("change",event => {
     if (event.target.name !== "question_source") return;
-    questionSources.set(event.target.dataset.question,event.target.value);
+    questionSources.set(event.target.dataset.answerKey || event.target.dataset.question,event.target.value);
     lastInboxSignature="";
     renderActivityQuestions();
   });
   document.addEventListener("submit",event => {
+    if (event.target.id === "onboarding-form") {event.preventDefault();saveOnboarding();return;}
     const form = event.target.closest(".activity-answer-form");
     if (!form) return;
     event.preventDefault();
     if (dirty.profile) { showNotice("Save or discard your unsaved profile changes before confirming an application answer.",true); return; }
-    const item = recordedQuestion(form.dataset.jobId,form.dataset.question);
+    const item = recordedQuestion(form.dataset.jobId,form.dataset.question,form.dataset.bindingKey || null);
     if (!item) { showNotice("This question changed. Refresh Activity before confirming an answer.",true); return; }
     if (form.dataset.optionsSignature !== JSON.stringify([item.type,item.options])) { showNotice("The available choices changed. Review them and choose your answer again.",true); return; }
     let answer, choiceLabel;
@@ -747,13 +1020,48 @@
       answer = options[selected].value;
       if (["select","radio"].includes(item.type)) choiceLabel = options[selected].label;
     } else answer = form.elements.answer.value.trim();
-    action(`question-${item.job_id}-${item.id || item.question}`,form.querySelector('button[type="submit"]'),async () => {
-      const result = await post("/api/answers",{question:item.question,answer,job_id:item.job_id,...(choiceLabel === undefined ? {} : {choice_label:choiceLabel})});
-      questionDrafts.delete(`${item.job_id}:${item.question}`);
+    const continueAfter=event.submitter?.value === "continue";
+    const scope=form.elements.answer_scope?.value || (item.job_id ? "application" : "global");
+    const expectedFingerprint=state.approval?.candidate_fingerprint;
+    if (continueAfter && (!expectedFingerprint || state.approval?.approved !== true || dirty.rules || dirty.profile)) {showNotice("Save this answer, then review and approve your current profile and rules before running the queue.",true);return;}
+    action(`question-${item.job_id}-${item.id || item.question}`,event.submitter || form.querySelector('button[type="submit"]'),async () => {
+      const result = await post("/api/answers",{question:item.question,answer,job_id:item.job_id,scope,...(item.intent_id && scope === "global" ? {intent_id:item.intent_id,confirm_intent:true} : {}),...(choiceLabel === undefined ? {} : {choice_label:choiceLabel}),...(continueAfter ? {approve_and_continue:true,expected_fingerprint:expectedFingerprint} : {})});
+      questionDrafts.delete(form.dataset.draftKey || `${item.job_id}:${item.question}`);
+      if (onboardingSnapshot && !onboardingDirty) {onboardingStarted=false;loadOnboarding();}
+      if (continueAfter) {
+        if (!result.continue_ready) throw new Error("The answer was saved, but the queue was not cleared to run. Refresh status and review the remaining questions.");
+        try {
+          if (!Number.isSafeInteger(result.stop_generation) || result.stop_generation < 0) throw new Error("The continuation is missing its cancellation check. Use Run when you are ready.");
+          await post(`/api/run?expected_stop_generation=${result.stop_generation}`);setView("queue");
+        }
+        catch(error) {throw new Error(`The answer was saved. The queue did not start: ${error.message}`);}
+      }
       return result;
-    },"Answer confirmed and remembered for this exact question. It is now shown in Rules → Saved application answers. Review and approve the updated details before running again.");
+    },continueAfter ? "Answer confirmed. A one-time approved queue run has started; follow observed progress below." : "Answer confirmed in the selected scope. Review and approve the updated details before running again.");
   });
   document.addEventListener("click", event => {
+    const setupButton=event.target.closest("[data-setup-action]");
+    if (setupButton) {
+      const actionName=setupButton.dataset.setupAction;
+      if (onboardingSaving) return;
+      if (["retry","reload"].includes(actionName)) {loadOnboarding(actionName==="reload");return;}
+      if (["step","back","skip"].includes(actionName)) {
+        if (onboardingDirty) {showNotice("Save this step before moving on. Your unsaved answers are still here.",true);return;}
+        const next=actionName==="step" ? Number(setupButton.dataset.step) : onboardingStep+(actionName==="back" ? -1 : 1);
+        if (next>=list(onboardingSnapshot?.catalog).length) setView("queue"); else beginOnboardingStep(next);
+        return;
+      }
+      const key=setupButton.dataset.record;
+      if (actionName==="add-record") {
+        const section=onboardingRecordSections(list(onboardingSnapshot.catalog)[onboardingStep]).find(item => (item.key || item.id)===key);
+        if (!section) return;
+        onboardingDraft.records[key].push(onboardingNewRecord(section,crypto.randomUUID()));
+      } else if (actionName==="remove-record") onboardingDraft.records[key].splice(Number(setupButton.dataset.index),1);
+      else return;
+      onboardingDirty=true;
+      renderOnboarding();
+      return;
+    }
     const viewButton = event.target.closest("[data-view]");
     if (viewButton) { setView(viewButton.dataset.view); return; }
     const button = event.target.closest("[data-action]");
@@ -780,7 +1088,8 @@
       setView("activity");
       const form = id ? [...document.querySelectorAll("#activity-question-list .activity-answer-form")].find(item => item.dataset.jobId === id) : null;
       if (form?.closest("details")) form.closest("details").open=true;
-      (form || $("#activity-questions")).scrollIntoView({block:"start",behavior:"smooth"});
+      const siteAction=id ? $$("#site-action-list .site-action-card").find(item => item.dataset.jobId===id) : null;
+      (form || siteAction || $("#activity-questions")).scrollIntoView({block:"start",behavior:"smooth"});
     } else if (name === "open-memory") {
       setView("profile");
       $("#answer-memory").scrollIntoView({block:"start",behavior:"smooth"});
@@ -794,7 +1103,7 @@
       const item = list(state.answer_memory?.saved)[Number(button.dataset.index)];
       if (!item) return;
       if (dirty.profile) { showNotice("Save your pending profile changes before editing answer memory.",true); return; }
-      action("answer-memory",button,() => api("/api/answers",{method:"DELETE",body:JSON.stringify({question:item.question})}),"Answer removed. Review and approve your updated profile before running applications.");
+      action("answer-memory",button,() => api("/api/answers",{method:"DELETE",body:JSON.stringify({question:item.question,...(item.scope ? {scope:item.scope,company:item.company || undefined,job_id:item.job_id || undefined} : {})})}),"Answer removed. Review and approve your updated profile before running applications.");
     } else if (name === "details") {
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
       const detail = document.getElementById(button.getAttribute("aria-controls"));
@@ -833,7 +1142,7 @@
     if (!form.elements.acknowledge.checked) return;
     const choice = !form.elements.choice.disabled;
     const answer = choice ? form.dataset.kind === "checkbox" ? form.elements.choice.value === "true" : form.elements.choice.value : form.elements.answer.value.trim();
-    const body = {question:form.elements.question.value.trim(),answer};
+    const body = {question:form.elements.question.value.trim(),answer,scope:form.elements.job_id.value ? "application" : "global"};
     if (form.elements.job_id.value) body.job_id = form.elements.job_id.value;
     action("answer-memory",$("button[type=submit]",form),async () => { const result = await post("/api/answers",body); resetAnswerForm(); return result; },"Answer remembered locally for this exact question. Review and approve your updated profile before running applications.");
   });
@@ -856,7 +1165,7 @@
       answers = form.elements.answers.value.trim() ? JSON.parse(form.elements.answers.value) : {};
       if (!answers || Array.isArray(answers) || typeof answers !== "object" || Object.values(answers).some(value => !["string","boolean"].includes(typeof value))) throw new Error();
     } catch { showNotice('Approved answers must be a JSON object of exact questions and text or true/false answers, for example: {"Question?": "Answer"}.',true); form.elements.answers.focus(); return; }
-    const body = {};
+    const body = {...state.profile,expected_revision:profileEditorRevision || state.profile_revision};
     ["name","first_name","last_name","preferred_first_name","email","phone","location","linkedin","github","portfolio","current_company"].forEach(name => { body[name] = form.elements[name].value.trim(); });
     body.skills = splitLines(form.elements.skills.value);
     body.approved_work_locations = splitLines(form.elements.approved_work_locations.value);
@@ -866,7 +1175,7 @@
     body.work_authorized = booleanValue(form.elements.work_authorized.value);
     body.needs_sponsorship = booleanValue(form.elements.needs_sponsorship.value);
     body.answers = answers;
-    action("profile",$("button[type=submit]",form),async () => { await post("/api/profile",body); markSaved("profile"); },"Profile saved. Review and approve your rules before running applications.");
+    action("profile",$("button[type=submit]",form),async () => { await post("/api/profile",body); markSaved("profile"); if (!onboardingDirty) onboardingStarted=false; },"Profile saved. Review and approve your rules before running applications.");
   });
   $("#rules-form").addEventListener("submit",event => {
     event.preventDefault();

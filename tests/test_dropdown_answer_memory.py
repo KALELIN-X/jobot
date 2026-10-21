@@ -53,7 +53,18 @@ def test_confirmed_query_is_provisional_persists_and_revokes_approval_without_ru
     assert response.status_code == 200, response.text
     assert response.json()["answer_kind"] == "lookup_query" and response.json()["choice_validation_required"] is True
     assert not store.get("approval")["approved"] and not store.get("automation")["enabled"]
-    assert store.job("held-city") == original and not original["attempted_at"]
+    saved = store.job("held-city")
+    # Saving a confirmed answer refreshes eligibility/ranking metadata. It must
+    # not change queue membership, replace the observed question, or reserve a
+    # submission merely because that refresh updated the row timestamp.
+    for key in ("id", "company", "title", "status", "pending_questions", "form_questions", "attempted_at", "confirmation", "applied_at"):
+        assert saved.get(key) == original.get(key)
+    assert saved["status"] == "needs_attention" and saved["attempted_at"] is None
+    assert not store.destination_attempted(saved)
+    with store.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM destination_attempts").fetchone()[0] == 0
+    assert not any(event["type"] in {"run_started", "application_progress"} for event in store.events())
     state = client.get("/api/state").json()
     assert state["profile"]["answers"] == {QUESTION: "Boston"}
     assert state["answer_memory"]["pending"] == []

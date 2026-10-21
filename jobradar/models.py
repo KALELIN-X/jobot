@@ -4,6 +4,7 @@ import re
 from datetime import date
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator, model_validator
+from .candidate_profile import ApplicationProfile
 
 
 class StrictModel(BaseModel):
@@ -68,12 +69,13 @@ class Profile(StrictModel):
     portfolio: str = Field(default="", max_length=1000)
     current_company: str = Field(default="", max_length=200)
     skills: list[str] = Field(default_factory=list, max_length=100)
-    experience_months: int | None = Field(default=None, ge=0, le=720)
+    experience_months: int | None = Field(default=None, strict=True, ge=0, le=720)
     graduation_date: str | None = None
     graduation_month: StrictStr | None = None
-    work_authorized: bool | None = None
-    needs_sponsorship: bool | None = None
+    work_authorized: StrictBool | None = None
+    needs_sponsorship: StrictBool | None = None
     answers: dict[str, StrictStr | StrictBool] = Field(default_factory=dict, max_length=60)
+    application_profile: ApplicationProfile = Field(default_factory=ApplicationProfile)
 
     @field_validator("email")
     @classmethod
@@ -128,6 +130,11 @@ class Profile(StrictModel):
         if any(not key.strip() or len(key) > 500 or (isinstance(value, str) and (not value.strip() or len(value) > 4000)) for key, value in values.items()):
             raise ValueError("Saved answers need a question and answer (up to 4,000 characters).")
         return {key.strip(): value.strip() if isinstance(value, str) else value for key, value in values.items()}
+
+
+class ProfileSaveRequest(Profile):
+    # Transport-only revision. It is never persisted as candidate information.
+    expected_revision: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class Rules(StrictModel):

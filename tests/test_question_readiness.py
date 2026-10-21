@@ -92,7 +92,7 @@ def test_unanswered_optional_questions_remain_optional(client):
     assert client.get("/api/state").json()["queue"]["can_run"] is True
 
 
-def test_optional_provided_answer_conflict_blocks_until_corrected_or_forgotten(client):
+def test_optional_provided_answer_conflict_is_visible_but_does_not_block(client):
     configure_and_approve(client)
     add_job(client, "questions")
     options = [{"label": "Boston", "value": "bos"}]
@@ -102,7 +102,7 @@ def test_optional_provided_answer_conflict_blocks_until_corrected_or_forgotten(c
     saved = role(client)
     assert saved["unanswered_question_count"] == 0
     assert saved["conflicting_answer_count"] == 1
-    assert saved["submission_check"]["eligible"] is False
+    assert saved["submission_check"]["eligible"] is True
     assert client.request("DELETE", "/api/answers", headers=HEADERS,
                           json={"question": "Preferred office?"}).status_code == 200
     saved = role(client)
