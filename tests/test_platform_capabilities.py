@@ -26,12 +26,12 @@ SMART = "https://jobs.smartrecruiters.com/Example/744000123456789-engineer"
     ("https://ats.rippling.com/example/jobs/123", "rippling"),
     ("https://career5.successfactors.eu/career?company=example", "successfactors"),
 ])
-def test_known_platform_does_not_confer_automatic_submission(url, platform):
+def test_provider_recognition_does_not_grant_legacy_runner_permission(url, platform):
     assert platform_for_url(url) == platform
-    assert not platform_support({"apply_url": url})["automatic_submission_supported"]
+    assert platform_support({"apply_url": url})["automatic_submission_supported"] == (platform in {"ashby", "smartrecruiters", "workday"})
     with pytest.raises(URLNotApproved):
         validate_application_url(url, {"jobs.ashbyhq.com", "jobs.smartrecruiters.com", "example.wd5.myworkdayjobs.com"})
-    assert SUPPORTED_ATS == {"lever", "greenhouse"}
+    assert SUPPORTED_ATS == {"lever", "greenhouse", "ashby", "smartrecruiters", "workday"}
 
 
 @pytest.mark.parametrize("url", [
@@ -46,9 +46,9 @@ def test_malformed_or_confused_platform_links_do_not_enable_inspection(url):
 
 def test_catalog_separates_automatic_inspection_and_manual():
     catalog = {item["platform"]: item for item in platform_catalog()}
-    assert {key for key, item in catalog.items() if item["automatic_submission_supported"]} == {"lever", "greenhouse"}
-    assert catalog["ashby"]["mode"] == catalog["smartrecruiters"]["mode"] == "inspection_only"
-    assert catalog["workday"]["mode"] == "manual"
+    assert {key for key, item in catalog.items() if item["automatic_submission_supported"]} == {"lever", "greenhouse", "ashby", "smartrecruiters", "workday"}
+    assert catalog["ashby"]["resumable"] and catalog["smartrecruiters"]["resumable"]
+    assert catalog["workday"]["resumable"]
     assert not platform_support({"apply_url": "https://jobs.ashbyhq.com/example"})["can_inspect"]
 
 
@@ -72,6 +72,12 @@ def source_job(client, url=ASHBY):
     job = {"id": "public-check", "company": "Example", "title": "Engineer", "location": "Boston, MA",
            "status": "needs_attention", "apply_url": url, "ats": "unsupported", "source": "SimplifyJobs",
            "source_url": SIMPLIFY_SOURCE_URL, "source_listing": {"company": "Example", "title": "Engineer", "location": "Boston, MA"}}
+    from jobradar.destinations import parse_destination, public_detail_url
+    from jobradar.sources import _stamp_source
+    destination = parse_destination(url)
+    job.update(ats=destination["ats"], detail_url=destination["canonical_url"], apply_url=destination["apply_url"],
+               employer_verified={"source_url": public_detail_url(destination), "application_key": destination["application_key"], "posting_id": destination["posting_id"]})
+    _stamp_source(job)
     client.app.state.store.save_job(job)
     return job
 

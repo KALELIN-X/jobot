@@ -263,7 +263,7 @@ SNAPSHOT_JS = r"""(token) => {
         (el.type === 'file' && group?.getAttribute('aria-required') === 'true') ||
         (box && (box.classList.contains('required') || !!box.querySelector('.required')))),
       disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'), visible: visible(el),
-      value: el.value || '', checked: !!el.checked, has_file: !!(el.files && el.files.length),
+      value: el.type === 'password' ? '' : el.value || '', checked: !!el.checked, has_file: !!(el.files && el.files.length),
       multiple: isCombo ? metadata.multiple : !!(el.multiple || el.getAttribute('aria-multiselectable') === 'true'),
       options: el.options ? Array.from(el.options).slice(0,300).map(o => ({value: o.value, label: text(o), disabled: !!(o.disabled || o.closest('optgroup')?.disabled)})) : []};
   });

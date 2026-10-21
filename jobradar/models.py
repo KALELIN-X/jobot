@@ -20,6 +20,18 @@ class AutomationRequest(StrictModel):
     enabled: StrictBool
 
 
+class ApplicationResumeRequest(StrictModel):
+    session_id: StrictStr = Field(pattern=r"^[0-9a-f]{48}$")
+    pause_id: StrictStr = Field(pattern=r"^[0-9a-f]{32}$")
+    acknowledge: StrictBool = False
+    expected_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ApplicationSessionRequest(StrictModel):
+    session_id: StrictStr = Field(pattern=r"^[0-9a-f]{48}$")
+    pause_id: StrictStr = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class JobStatusRequest(StrictModel):
     status: Literal["new", "queued", "dismissed"]
 
@@ -45,13 +57,13 @@ class ExternalApplicationRequest(StrictModel):
     def check_application_url(cls, value):
         from .store import application_key
         if value is not None and application_key({"apply_url": value}) is None:
-            raise ValueError("Enter an HTTPS Lever or Greenhouse posting URL with a valid posting ID.")
+            raise ValueError("Enter a supported HTTPS employer posting URL with a valid posting ID.")
         return value
 
     @model_validator(mode="after")
     def require_listing_or_url(self):
         if self.url is None and self.job_id is None:
-            raise ValueError("Provide a saved job ID or an HTTPS Lever or Greenhouse posting URL.")
+            raise ValueError("Provide a saved job ID or a supported HTTPS employer posting URL.")
         return self
 
 
@@ -142,7 +154,7 @@ class Rules(StrictModel):
     companies: list[str] = Field(default_factory=list, max_length=30)
     company_boards: dict[str, str] = Field(default_factory=dict, max_length=10)
     locations: list[str] = Field(default_factory=list, max_length=30)
-    allowed_ats: list[str] = Field(default_factory=lambda: ["lever", "greenhouse"])
+    allowed_ats: list[str] = Field(default_factory=lambda: ["lever", "greenhouse", "ashby", "smartrecruiters", "workday"])
     min_score: int = Field(default=60, ge=0, le=100)
     max_required_experience_months: int | None = Field(default=None, strict=True, ge=0, le=120)
     prefer_new_grad: StrictBool = False
@@ -175,8 +187,9 @@ class Rules(StrictModel):
     @field_validator("allowed_ats")
     @classmethod
     def check_ats(cls, values):
-        if len(values) != len(set(values)) or any(value not in {"lever", "greenhouse"} for value in values):
-            raise ValueError("Supported automatic application systems are Lever and Greenhouse; leave the list empty to disable them.")
+        from .destinations import SUPPORTED_ATS
+        if len(values) != len(set(values)) or any(value not in SUPPORTED_ATS for value in values):
+            raise ValueError("Choose supported application systems; leave the list empty to disable them.")
         return values
 
 

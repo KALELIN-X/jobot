@@ -40,13 +40,14 @@ async def _read_official_posting(endpoint):
     async with ingest._client() as client:
         async with client.stream("GET", endpoint, follow_redirects=False) as response:
             response.raise_for_status()
+            limit = sources.employer_response_limit(endpoint)
             size = response.headers.get("content-length", "")
-            if size.isdecimal() and int(size) > sources.MAX_EMPLOYER_BYTES:
+            if size.isdecimal() and int(size) > limit:
                 raise ValueError("Employer response exceeds the byte bound")
             data = bytearray()
             async for chunk in response.aiter_bytes():
                 data.extend(chunk)
-                if len(data) > sources.MAX_EMPLOYER_BYTES:
+                if len(data) > limit:
                     raise ValueError("Employer response exceeds the byte bound")
             return json.loads(bytes(data).decode("utf-8"))
 
@@ -54,6 +55,9 @@ async def _read_official_posting(endpoint):
 def _has_current_location(destination, payload):
     if not isinstance(payload, dict):
         return False
+    if destination["ats"] in {"ashby", "smartrecruiters", "workday"}:
+        # The provider parser validates the location together with posting ID.
+        return True
     if destination["ats"] == "greenhouse":
         location = payload.get("location")
         return isinstance(location, dict) and isinstance(location.get("name"), str) and bool(location["name"].strip())
@@ -87,6 +91,8 @@ async def refresh_candidate(job: dict) -> dict:
         if not _has_current_location(destination, payload):
             return _hold(result, "unavailable", "The employer's current work location is unavailable; cached location evidence cannot be reused.")
         result = sources.employer_metadata(result, payload)
+        if result.get("closed") is True:
+            return _hold(result, "closed", "The employer explicitly marks this posting unavailable for applications.", closed=True)
     except httpx.HTTPStatusError as error:
         if error.response.status_code in {404, 410}:
             return _hold(result, "closed", "The employer no longer publishes this posting (404/410).", closed=True)

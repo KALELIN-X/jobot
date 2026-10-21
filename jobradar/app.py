@@ -22,7 +22,7 @@ from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .destinations import SUPPORTED_HOSTS, verified_destination
 from .dashboard import application_events, application_review_actions
-from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, ProfileSaveRequest, QuestionLookupRequest, Rules, company_scope
+from .models import ApplicationResumeRequest, ApplicationSessionRequest, ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, ProfileSaveRequest, QuestionLookupRequest, Rules, company_scope
 from .job_facts import job_facts
 from .store import Store, application_key, now
 from .run_status import RunTracker
@@ -31,6 +31,7 @@ from .platforms import platform_catalog, platform_support
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_RESUME_BYTES = 5 * 1024 * 1024
+SESSION_JOB_FIELDS = ("apply_url", "company", "title", "location", "description")
 
 
 def ordered_queue(jobs, rules):
@@ -46,7 +47,13 @@ def create_app(data_dir: Path | None = None):
     data_dir = data_dir or Path(os.environ.get("JOBRADAR_DATA_DIR", str(ROOT / "data")))
     store = Store(data_dir / "jobradar.sqlite3")
     store.recover()
+    # Authenticated browser state is deliberately never written to disk.
+    for saved in store.jobs():
+        if (saved.get("verification") or {}).get("state") == "paused":
+            store.update_job(saved["id"], "needs_attention", verification={"state": "interrupted", "message": "The previous application browser ended with the server. Review the employer draft before starting a new session."})
     tracker = RunTracker(store)
+    from .application_sessions import ApplicationSessions
+    sessions = ApplicationSessions()
     state = {"running": False, "fetching": False, "task": None, "demo_running": False, "mock_tokens": set()}
     queue_lock = asyncio.Lock()
     question_lock = asyncio.Lock()
@@ -64,7 +71,7 @@ def create_app(data_dir: Path | None = None):
     def platform_check_problem(job):
         from .destinations import SIMPLIFY_SOURCE_URL
         protected = {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere", "dismissed"}
-        if job.get("demo") or job.get("attempted_at") or job["status"] in protected or store.destination_attempted(job):
+        if job.get("demo") or job.get("attempted_at") or job["status"] in protected or store.destination_attempted(job) or (job.get("verification") or {}).get("state") == "paused":
             return "Only an unattempted available role can run a public platform check."
         support = platform_support(job)
         if not support["can_inspect"]:
@@ -112,7 +119,7 @@ def create_app(data_dir: Path | None = None):
         selected = {}
         for job in jobs:
             if not job.get("demo") and (job["status"] in {"queued", "active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"}
-                                        or job.get("attempted_at")):
+                                        or job.get("attempted_at") or (job.get("verification") or {}).get("state") == "paused"):
                 key = application_key(job)
                 if key:
                     selected.setdefault(key, set()).add(job["id"])
@@ -120,7 +127,8 @@ def create_app(data_dir: Path | None = None):
 
     def queue_actions(job, selected=None):
         selected = selected if selected is not None else selected_destinations(store.jobs())
-        active_or_attempted = job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or bool(job.get("attempted_at"))
+        active_or_attempted = (job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"}
+                               or bool(job.get("attempted_at")) or (job.get("verification") or {}).get("state") == "paused")
         prior_destination = store.destination_attempted(job)
         duplicate_selected = bool(selected.get(application_key(job), set()) - {job["id"]})
         can_add = (not job.get("demo") and not active_or_attempted and not prior_destination and not duplicate_selected
@@ -332,7 +340,7 @@ def create_app(data_dir: Path | None = None):
             saved_jobs = [job for job in store.jobs() if not job.get("demo")]
             matching = sum(not matching_problems(job, rules) for job in saved_jobs if job["status"] == "new")
             ready = sum(submission_check(job, rules)["eligible"] for job in saved_jobs if job["status"] == "queued")
-            message = f"Fetched {len(jobs)} listings; {count} verified Lever or Greenhouse destinations. {matching} discovered roles match your rules; {ready} selected queued roles are ready."
+            message = f"Fetched {len(jobs)} listings; {count} verified employer destinations. {matching} discovered roles match your rules; {ready} selected queued roles are ready."
             summary = {"count": len(jobs), "verified_destinations": count,
                        "direct_links": sum(bool(job.get("apply_url")) for job in jobs),
                        "matching": matching, "ready": ready, "message": message,
@@ -343,6 +351,39 @@ def create_app(data_dir: Path | None = None):
             return summary
         finally:
             state["fetching"] = False
+
+    def session_callbacks(job, expected):
+        identity = tuple(job.get(k) for k in SESSION_JOB_FIELDS)
+        async def verify():
+            profile, rules, resume, approval = configuration()
+            fresh = store.job(job["id"])
+            if (store.get("stop_requested", False) or not valid_approval(profile, rules, resume, approval)
+                    or fingerprint(profile, rules, resume) != expected or not resume_intact(resume, data_dir)
+                    or not fresh or fresh["status"] not in {"filling", "needs_attention", "submitting"}
+                    or tuple(fresh.get(k) for k in SESSION_JOB_FIELDS) != identity):
+                raise ValueError("The reviewed application configuration changed or was stopped.")
+            control = sessions.sessions.get(job["id"])
+            reserved_here = bool(control and control.reserved and fresh.get("attempted_at"))
+            candidate = {**fresh, "attempted_at": None, "status": "filling"} if reserved_here else fresh
+            if job_problems(candidate, rules) or (store.destination_attempted(fresh) and not reserved_here):
+                raise ValueError("The application no longer passes its approved rules or history checks.")
+            return True
+        async def reserve():
+            await verify()
+            _, rules, _, _ = configuration()
+            store.reserve_attempt(job["id"], datetime.now(timezone.utc).date().isoformat(), rules["daily_limit"])
+        return verify, reserve
+
+    def save_session_result(job, result):
+        status = result.get("status", "needs_attention")
+        status = "needs_attention" if status == "paused" else status
+        if status not in {"submitted", "needs_attention", "uncertain", "failed"}:
+            status = "needs_attention"
+        store.update_job(job["id"], status, message=result.get("message"), error=None if status == "submitted" else result.get("message"),
+                         confirmation=result.get("confirmation"), applied_at=now() if status == "submitted" else None,
+                         verification=result.get("verification", {"state": "ended"}), pending_questions=result.get("pending_questions", []))
+        store.event(status, f"{job['company']} — {job['title']}: {result.get('message', status)}", job["id"])
+        return status
 
     async def run_queue():
         from .answer_memory import _recorded_candidates
@@ -457,7 +498,12 @@ def create_app(data_dir: Path | None = None):
                     async def on_progress(event, active_job=job):
                         tracker.report(event, active_job)
 
-                    result = await run_application(job, profile, data_dir / "resumes" / resume["stored_name"], allowed_hosts=set(SUPPORTED_HOSTS), artifacts_dir=data_dir / "artifacts" / job["id"], submit=True, before_submit=before_submit, on_progress=on_progress)
+                    if job.get("ats") in {"ashby", "smartrecruiters", "workday"}:
+                        verify, reserve = session_callbacks(job, expected)
+                        result = await sessions.start(job, profile, data_dir / "resumes" / resume["stored_name"],
+                                                      verify=verify, reserve=reserve, on_progress=on_progress, binding=expected)
+                    else:
+                        result = await run_application(job, profile, data_dir / "resumes" / resume["stored_name"], allowed_hosts=set(SUPPORTED_HOSTS), artifacts_dir=data_dir / "artifacts" / job["id"], submit=True, before_submit=before_submit, on_progress=on_progress)
                     result_status = result.get("status", "needs_attention")
                     if result_status not in {"submitted", "needs_attention", "uncertain", "failed"}:
                         result_status = "needs_attention"
@@ -473,7 +519,8 @@ def create_app(data_dir: Path | None = None):
                     observed = [item for item in observed if _label(item.get("question")) not in changed
                                 or _label(item.get("question")) in conflicting] + pending_questions
                     store.update_job(job["id"], result_status, message=result.get("message"), error=None if result_status == "submitted" else result.get("message"), confirmation=result.get("confirmation"), applied_at=now() if result_status == "submitted" else None, pending_questions=pending_questions, form_questions=observed,
-                                     **({"questions_refreshed_at": now()} if pending_questions else {}), screenshot=result.get("screenshot"))
+                                     **({"questions_refreshed_at": now()} if pending_questions else {}), screenshot=result.get("screenshot"),
+                                     verification=result.get("verification", {"state": "ended"}))
                     tracker.report({"stage": "finished" if result_status == "submitted" else result_status,
                                     "pending_question_count": len(result.get("pending_questions", []))}, job)
                     tracker.outcome(job, {"status": result_status})
@@ -493,6 +540,7 @@ def create_app(data_dir: Path | None = None):
     async def heartbeat():
         while True:
             tracker.heartbeat()
+            await sessions.expire()
             await asyncio.sleep(2)
 
     async def scheduler():
@@ -531,10 +579,12 @@ def create_app(data_dir: Path | None = None):
             state["task"].cancel()
         tasks = [scheduler_task, heartbeat_task] + ([state["task"]] if state["task"] else [])
         await asyncio.gather(*tasks, return_exceptions=True)
+        await sessions.close()
 
     app = FastAPI(title="Jobot", lifespan=lifespan, docs_url="/api/docs")
     app.state.store = store
     app.state.data_dir = data_dir
+    app.state.application_sessions = sessions
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
     register_answer_memory_routes(app, store, invalidate, continue_after_answer=continue_after_answer, on_profile_changed=rank_all)
     register_onboarding_routes(app, store, invalidate, rank_all)
@@ -576,6 +626,8 @@ def create_app(data_dir: Path | None = None):
         selected = selected_destinations(jobs)
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
+            pause = job.get("verification") or {}
+            job["resume_available"] = sessions.available(job["id"], pause.get("session_id"))
             job["platform_support"] = platform_support(job)
             job["platform_check_available"] = platform_check_problem(job) is None
             job["submission_check"] = submission_check(job, rules, profile)
@@ -707,7 +759,7 @@ def create_app(data_dir: Path | None = None):
             raise HTTPException(409, "Wait for the active application, fetch or public check to finish.")
         async with question_lock:
             public_job = {"apply_url": job.get("apply_url")}
-            if support["automatic_submission_supported"]:
+            if support["platform"] in {"lever", "greenhouse"}:
                 inspected = await inspect_questions(public_job)
                 from .platform_checks import _report
                 report = _report({"stage": inspected.get("status", "unavailable"), "fields": inspected.get("fields", []),
@@ -875,6 +927,8 @@ def create_app(data_dir: Path | None = None):
         job = store.job(job_id)
         if not job:
             raise HTTPException(404, "Job not found.")
+        if (job.get("verification") or {}).get("state") == "paused":
+            raise HTTPException(409, "Resume or cancel this application's existing browser before changing its queue state.")
         if job["status"] in {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere"} or job.get("attempted_at"):
             raise HTTPException(409, "An active or attempted application cannot be requeued automatically. Verify its outcome first.")
         actions = queue_actions(job)
@@ -887,6 +941,99 @@ def create_app(data_dir: Path | None = None):
             return {"ok": True, "status": status, "already_queued": True, "message": actions["reason"]}
         store.update_job(job_id, status, error=None)
         return {"ok": True, "status": status, "already_queued": False}
+
+    @app.post("/api/jobs/{job_id}/application/resume")
+    async def resume_application(job_id: str, body: ApplicationResumeRequest):
+        job = store.job(job_id)
+        if not job:
+            raise HTTPException(404, "Application not found.")
+        if not body.acknowledge:
+            raise HTTPException(409, "Confirm you completed and reviewed the displayed step in the Jobot application browser.")
+        profile, rules, resume, approval = configuration()
+        current = fingerprint(profile, rules, resume)
+        pause = job.get("verification") or {}
+        if (not valid_approval(profile, rules, resume, approval) or current != body.expected_fingerprint
+                or not resume_intact(resume, data_dir)):
+            raise HTTPException(409, "Review and approve the current profile, resume and rules before continuing.")
+        if (job.get("attempted_at") or store.destination_attempted(job) or job["status"] != "needs_attention"
+                or pause.get("session_id") != body.session_id or pause.get("pause_id") != body.pause_id
+                or not sessions.available(job_id, body.session_id)):
+            raise HTTPException(409, "This unattempted browser session is unavailable or already attempted. Review its employer outcome; do not retry blindly.")
+        control = sessions.sessions[job_id]
+        if control.binding != current:
+            raise HTTPException(409, "Settings changed after this browser opened. Cancel it and start a newly reviewed session.")
+        if tuple(control.job.get(k) for k in SESSION_JOB_FIELDS) != tuple(job.get(k) for k in SESSION_JOB_FIELDS):
+            raise HTTPException(409, "The employer posting changed while this browser waited. Cancel it and review the refreshed role before starting again.")
+        if worker_busy() or state["fetching"] or question_lock.locked():
+            raise HTTPException(409, "Wait for the active queue, fetch or public check to finish.")
+        problems = job_problems(job, rules)
+        if problems:
+            raise HTTPException(409, " ".join(problems))
+        verify, reserve = session_callbacks(job, current)
+        store.set("stop_requested", False)
+        store.update_job(job_id, "filling", verification={**pause, "state": "resuming"})
+        state["running"] = True
+        async def resume_work():
+            async with queue_lock:
+                tracker.start(total=1)
+                try:
+                    async def progress(event):
+                        tracker.report(event, job)
+                    result = await sessions.resume(job_id, body.session_id, acknowledge=True, verify=verify,
+                                                   reserve=reserve, profile=profile, binding=current, on_progress=progress, pause_id=body.pause_id)
+                    status = save_session_result(job, result)
+                    tracker.report({"stage": "finished" if status == "submitted" else status}, job)
+                    tracker.outcome(job, {"status": status})
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    fresh = store.job(job_id)
+                    status = "uncertain" if fresh and fresh.get("attempted_at") else "needs_attention"
+                    save_session_result(job, {"status": status, "message": "Resume could not complete. Review this application's browser and recorded outcome before restarting."})
+                finally:
+                    tracker.finish(status="paused" if store.get("stop_requested", False) else "completed")
+                    state["running"] = False
+        state["task"] = asyncio.create_task(resume_work())
+        return {"message": "Resuming the existing application browser. Watch Activity for its next step or confirmation."}
+
+    @app.post("/api/jobs/{job_id}/application/cancel")
+    async def cancel_application(job_id: str, body: ApplicationSessionRequest):
+        job = store.job(job_id)
+        if not job:
+            raise HTTPException(404, "Application not found.")
+        receipt = job.get("verification") or {}
+        if receipt.get("session_id") != body.session_id or receipt.get("pause_id") != body.pause_id:
+            raise HTTPException(409, "The application browser changed. Review its current step before closing it.")
+        if job.get("attempted_at") or job["status"] in {"filling", "submitting", "submitted", "uncertain"}:
+            raise HTTPException(409, "An active or attempted application cannot be cancelled as an unattempted browser.")
+        try:
+            await sessions.cancel(job_id)
+        except ValueError as error:
+            raise HTTPException(409, str(error))
+        # Browser cleanup yields; preserve history recorded while it was closing.
+        fresh = store.job(job_id)
+        current_receipt = (fresh or {}).get("verification") or {}
+        if current_receipt.get("session_id") != body.session_id or current_receipt.get("pause_id") != body.pause_id:
+            raise HTTPException(409, "The saved application step changed while its browser was closing. Review its current status.")
+        store.update_job(job_id, fresh["status"], verification={"state": "cancelled", "message": "The local browser was closed. Any draft already saved by the employer remains on its site."})
+        return {"message": "Local application browser closed. Employer-side drafts are not deleted."}
+
+    @app.post("/api/jobs/{job_id}/application/focus")
+    async def focus_application(job_id: str, body: ApplicationSessionRequest):
+        job = store.job(job_id)
+        if not job:
+            raise HTTPException(404, "Application not found.")
+        receipt = job.get("verification") or {}
+        if receipt.get("session_id") != body.session_id or receipt.get("pause_id") != body.pause_id:
+            raise HTTPException(409, "The application browser changed. Review its current step before showing it.")
+        control = sessions.sessions.get(job_id)
+        if not control or control.closed or control.busy or not sessions.available(job_id, (job.get("verification") or {}).get("session_id")):
+            raise HTTPException(409, "No paused application browser is available.")
+        try:
+            await control.page.bring_to_front()
+        except Exception:
+            raise HTTPException(409, "The application browser is no longer available. Review the saved draft before restarting.")
+        return {"message": "The existing Jobot application browser was brought forward. Complete its displayed step, then return here to resume."}
 
     @app.post("/api/applied-elsewhere")
     async def applied_elsewhere(body: ExternalApplicationRequest):

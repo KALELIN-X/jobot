@@ -25,10 +25,15 @@ function helpers(overrides = {}) {
 const manual = {platform:"workday",label:"Workday",automatic_submission_supported:false,can_inspect:true,mode:"inspection_only",reason:"Account or employer-specific steps need review.",next_action:"Open the employer form to continue manually."};
 const job = {id:"example-role",status:"new",platform_support:manual};
 
-test("automatic badges are limited to explicit Lever and Greenhouse capabilities",() => {
+test("automatic and resumable badges follow the five explicit provider capabilities",() => {
   const {platformMode} = helpers().helpers;
   for (const platform of ["lever","greenhouse"]) assert.equal(platformMode({platform,automatic_submission_supported:true}).className,"automatic");
-  for (const platform of ["ashby","smartrecruiters","workday","icims","taleo","rippling",undefined]) {
+  for (const platform of ["ashby","smartrecruiters","workday"]) {
+    const mode=platformMode({platform,automatic_submission_supported:true,can_inspect:true,resumable:true});
+    assert.equal(mode.className,"resumable");
+    assert.match(mode.label,/pause & resume/);
+  }
+  for (const platform of ["icims","taleo","rippling","successfactors",undefined]) {
     assert.equal(platformMode({platform,automatic_submission_supported:true,can_inspect:true}).className,"inspection");
   }
   assert.equal(platformMode({...manual,automatic_submission_supported:"true"}).className,"inspection");
@@ -56,11 +61,23 @@ test("compatibility catalogue distinguishes automatic, inspection and manual pro
     {...manual,platform:"ashby",label:"Ashby"},manual,
     {...manual,platform:"taleo",label:"Taleo",can_inspect:false},
   ]);
-  assert.match(html,/2 automatic · 2 inspection-only · 1 manual/);
+  assert.match(html,/2 automatic · 0 with pause &amp; resume · 2 inspection-only · 1 manual/);
   assert.match(html,/Read-only check · manual application/);
   assert.match(html,/Open the employer form to continue manually/);
   assert.doesNotMatch(html,/majority|all platforms|works everywhere/i);
   assert.match(helpers().helpers.platformCatalogMarkup(null),/local server returns its support list/);
+});
+
+test("the catalogue distinguishes two automatic adapters from three resumable adapters",() => {
+  const entries=[
+    ...["lever","greenhouse"].map(platform=>({platform,label:platform,automatic_submission_supported:true,can_inspect:true})),
+    ...["ashby","smartrecruiters","workday"].map(platform=>({platform,label:platform,automatic_submission_supported:true,can_inspect:true,resumable:true})),
+    ...["icims","taleo","rippling","successfactors"].map(platform=>({platform,label:platform,automatic_submission_supported:false,can_inspect:false})),
+  ];
+  const html=helpers().helpers.platformCatalogMarkup(entries);
+  assert.match(html,/2 automatic · 3 with pause &amp; resume · 4 manual/);
+  assert.equal((html.match(/platform-mode resumable/g)||[]).length,3);
+  assert.doesNotMatch(html,/majority|works everywhere|all platforms|fully unattended/i);
 });
 
 test("a posting-only report cannot imply that the complete application was tested",() => {

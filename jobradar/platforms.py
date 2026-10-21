@@ -14,9 +14,9 @@ from .destinations import parse_destination
 _DEFINITIONS = (
     ("lever", "Lever", True, True, "The bounded hosted-form adapter supports tested native controls and one guarded submission."),
     ("greenhouse", "Greenhouse", True, True, "The bounded hosted-form adapter supports tested uploads, dropdowns and one guarded submission."),
-    ("ashby", "Ashby", False, True, "Public form inspection is available. Typing and uploads can create server-side form state; a dedicated mutation-aware application adapter is still required."),
-    ("smartrecruiters", "SmartRecruiters", False, True, "Public form inspection is available. Multi-step forms, repeated records, uploads and final submission still need a dedicated application adapter."),
-    ("workday", "Workday", False, False, "Tenant-specific application steps, candidate accounts and verification are not implemented in this worker."),
+    ("ashby", "Ashby", True, True, "Bounded hosted application flow with posting-bound answer writes, selected resume upload and one final attempt. Verification, agreements and unfamiliar controls pause in a separate browser."),
+    ("smartrecruiters", "SmartRecruiters", True, True, "Bounded OneClick flow with published posting/publication binding, selected resume upload and one final attempt. Unfamiliar steps pause in a separate browser."),
+    ("workday", "Workday", True, False, "Bounded tenant/site/requisition application flow. Complete account access and verification yourself in the separate browser, then resume; unknown tenant transports remain held."),
     ("icims", "iCIMS", False, False, "Candidate portals and employer-specific application steps are not implemented in this worker."),
     ("taleo", "Taleo", False, False, "Account-based and employer-specific application steps are not implemented in this worker."),
     ("rippling", "Rippling", False, False, "The multi-step candidate form and agreement flow are not implemented in this worker."),
@@ -39,12 +39,12 @@ def _safe_parts(url):
 
 
 def platform_for_url(url) -> str:
-    parts = _safe_parts(url)
-    if parts is None:
-        return "unknown"
     parsed = parse_destination(url)
     if parsed:
         return parsed["ats"]
+    parts = _safe_parts(url)
+    if parts is None:
+        return "unknown"
     host = parts.hostname
     # These identities classify public links; only the two explicit inspector
     # parsers below can confer even a read-only browser capability.
@@ -66,7 +66,7 @@ def platform_for_url(url) -> str:
 
 
 def platform_catalog() -> list[dict]:
-    return [{"platform": platform, "label": label, "automatic_submission_supported": automatic,
+    return [{"platform": platform, "label": label, "automatic_submission_supported": automatic, "resumable": platform in {"ashby", "smartrecruiters", "workday"},
              "can_inspect": inspect, "mode": "automatic" if automatic else "inspection_only" if inspect else "manual",
              "reason": reason, "next_action": "Review your profile and queue rules before running." if automatic else
              "Use the public check to identify visible fields and blockers; finish the application on the employer site." if inspect else
