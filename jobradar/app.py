@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import math
 import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from copy import deepcopy
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
@@ -19,11 +21,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .answer_memory import answer_memory_state, register_answer_memory_routes
 from .approval import fingerprint, job_problems, resume_intact, setup_problems, valid_approval
 from .destinations import SUPPORTED_HOSTS, verified_destination
-from .dashboard import application_events
-from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, QuestionLookupRequest, Rules, company_scope
+from .dashboard import application_events, application_review_actions
+from .models import ApprovalRequest, AutomationRequest, ExternalApplicationRequest, JobStatusRequest, Profile, ProfileSaveRequest, QuestionLookupRequest, Rules, company_scope
 from .job_facts import job_facts
 from .store import Store, application_key, now
 from .run_status import RunTracker
+from .onboarding import onboarding_state, profile_revision, register_onboarding_routes
+from .platforms import platform_catalog, platform_support
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_RESUME_BYTES = 5 * 1024 * 1024
@@ -57,6 +61,24 @@ def create_app(data_dir: Path | None = None):
     def worker_busy():
         return state["running"] or state["demo_running"] or bool(state["task"] and not state["task"].done())
 
+    def platform_check_problem(job):
+        from .destinations import SIMPLIFY_SOURCE_URL
+        protected = {"active", "applying", "filling", "submitting", "submitted", "uncertain", "applied_elsewhere", "dismissed"}
+        if job.get("demo") or job.get("attempted_at") or job["status"] in protected or store.destination_attempted(job):
+            return "Only an unattempted available role can run a public platform check."
+        support = platform_support(job)
+        if not support["can_inspect"]:
+            return support["reason"]
+        if job.get("closed") is True:
+            return "The saved posting is closed. Refresh it before inspecting its form."
+        if support["automatic_submission_supported"]:
+            if not verified_destination(job):
+                return "Refresh the verified employer link before inspecting its form."
+        elif (job.get("source") != "SimplifyJobs" or job.get("source_url") != SIMPLIFY_SOURCE_URL
+              or not isinstance(job.get("source_listing"), dict)):
+            return "A source-published job link is required for public inspection. Fetch this posting before checking its platform."
+        return None
+
     def configuration_problems(profile, rules, resume):
         problems = setup_problems(profile, rules, resume)
         if resume.get("loaded") and not resume_intact(resume, data_dir):
@@ -71,7 +93,8 @@ def create_app(data_dir: Path | None = None):
         pending = answer_memory_state(profile, [job])["pending"]
         answers = profile.get("answers") or {}
         required = sum(question.get("required") is True for question in pending)
-        conflicting = sum(question.get("required") is not True and question["question"] in answers for question in pending)
+        conflicting = sum(question.get("required") is not True and
+                          (question.get("has_saved_answer") or question["question"] in answers) for question in pending)
         return required, conflicting
 
     def matching_problems(job, rules, profile=None):
@@ -81,8 +104,8 @@ def create_app(data_dir: Path | None = None):
         required, conflicting = unanswered_question_counts(job, profile)
         if required:
             problems.append(f"{required} required application question(s) still need your confirmed answer. Answer them in Activity before running this role.")
-        if conflicting:
-            problems.append(f"{conflicting} saved answer(s) do not match this form's recorded choices or input type. Review them in Activity.")
+        # A mismatching optional answer stays visible in Activity, but an
+        # optional blank must not stop an otherwise eligible application.
         return problems
 
     def selected_destinations(jobs):
@@ -202,6 +225,18 @@ def create_app(data_dir: Path | None = None):
         store.set("stop_requested", True)
         tracker.request_stop()
 
+    def manual_stop():
+        # Distinguish the user's Stop from the temporary stop caused by saving
+        # an answer. A pending confirmation must never undo a later cancellation.
+        with store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value FROM config WHERE key='stop_generation'").fetchone()
+            generation = (json.loads(row[0]) if row else 0) + 1
+            for key, value in (("stop_generation", generation), ("stop_requested", True),
+                               ("automation", {"enabled": False})):
+                connection.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (key, json.dumps(value)))
+        return generation
+
     def rank_all():
         from .ranking import rank_job
         profile, rules, resume, _ = configuration()
@@ -211,6 +246,73 @@ def create_app(data_dir: Path | None = None):
             detail = rank_job(job, profile, resume.get("text", ""), rules)
             job.update(score=detail.get("score"), score_detail=detail)
             store.save_job(job)
+
+    def continue_after_answer(*, action, body, before_token=None, changed=False, updated_profile=None):
+        """Explicit one-click confirmation, never an automatic retry policy.
+
+        The answer route holds its own profile write lock. The callback checks
+        the reviewed baseline before that edit, then atomically approves only
+        the exact written profile and otherwise unchanged rules/resume. The
+        dashboard requests a run separately through the existing guarded API.
+        """
+        if worker_busy() or state["fetching"] or question_lock.locked():
+            raise HTTPException(409, "Wait for the active run or lookup before confirming and continuing.")
+        if action == "before":
+            baseline_stop_generation = store.get("stop_generation", 0)
+            profile, rules, resume, prior_approval = configuration()
+            if body.expected_fingerprint != fingerprint(profile, rules, resume):
+                raise HTTPException(409, "Your saved profile or rules changed. Refresh and review them before continuing.")
+            if not valid_approval(profile, rules, resume, prior_approval):
+                raise HTTPException(409, "Review and approve your saved profile, resume and rules before using Confirm & run. This shortcut can only extend an already reviewed configuration with the answer you just confirmed.")
+            job = store.job(body.job_id)
+            if job is None:
+                raise HTTPException(404, "Application not found.")
+            if (job.get("demo") or job.get("attempted_at") or store.destination_attempted(job)
+                    or job["status"] not in {"new", "queued", "needs_attention"}):
+                raise HTTPException(409, "Only an unattempted application can continue. Existing submission attempts and history stay protected.")
+            return {"profile": deepcopy(profile), "rules": deepcopy(rules), "resume": deepcopy(resume),
+                    "stop_generation": baseline_stop_generation,
+                    "job_identity": {key: job.get(key) for key in ("company", "title", "apply_url")}}
+        if action != "after" or not before_token or updated_profile is None:
+            raise HTTPException(409, "The reviewed answer confirmation is missing.")
+        with store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            settings = {row["key"]: json.loads(row["value"]) for row in connection.execute("SELECT key,value FROM config")}
+            current_profile = settings.get("profile", Profile().model_dump())
+            current_rules = Rules.model_validate(settings.get("rules", {})).model_dump()
+            current_resume = settings.get("resume", {})
+            if settings.get("stop_generation", 0) != before_token["stop_generation"]:
+                raise HTTPException(409, "Your answer was saved, but you stopped automation during confirmation. No queue run was authorized.")
+            if (current_profile != updated_profile or current_rules != before_token["rules"]
+                    or current_resume != before_token["resume"]):
+                raise HTTPException(409, "Your answer was saved, but another setting changed. Review the current profile and rules before running.")
+            row = connection.execute("SELECT * FROM jobs WHERE id=?", (body.job_id,)).fetchone()
+            job = store._job(row) if row else None
+            if (job is None or job.get("attempted_at") or job["status"] not in {"new", "queued", "needs_attention"}
+                    or {key: job.get(key) for key in ("company", "title", "apply_url")} != before_token["job_identity"]):
+                raise HTTPException(409, "Your answer was saved, but the application changed. No retry or queue run was started.")
+            key = application_key(job)
+            if ((key and connection.execute("SELECT 1 FROM destination_attempts WHERE application_key=?", (key,)).fetchone())
+                    or store._identity_recorded(connection, job)):
+                raise HTTPException(409, "Your answer was saved. This posting is already in application history and cannot be retried.")
+            problems = configuration_problems(current_profile, current_rules, current_resume)
+            problems += matching_problems(job, current_rules, current_profile)
+            other_selected = selected_destinations(store.jobs()).get(key, set()) - {job["id"]}
+            if other_selected:
+                problems.append("Another record for this posting is already selected. Use that queue entry.")
+            if problems:
+                return {"continue_ready": False, "continue_reason": " ".join(dict.fromkeys(problems)), "approval_required": True}
+            approval = {"approved": True, "approved_at": now(),
+                        "fingerprint": fingerprint(current_profile, current_rules, current_resume)}
+            for name, value in (("approval", approval), ("automation", {"enabled": False}), ("stop_requested", False)):
+                connection.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (name, json.dumps(value)))
+            payload = {**json.loads(row["payload"]), "error": None,
+                       "message": "Confirmed answer saved; unattempted application returned to the reviewed queue."}
+            connection.execute("UPDATE jobs SET payload=?,status='queued',updated_at=? WHERE id=? AND attempted_at IS NULL",
+                               (json.dumps(payload), now(), job["id"]))
+        store.event("approval", "Confirmed answer and unchanged application settings approved for a one-time queue run. Scheduling remains off.", body.job_id)
+        return {"continue_ready": True, "approval_required": False, "queued": True,
+                "stop_generation": before_token["stop_generation"]}
 
     async def fetch():
         from .ingest import enrich_lever_jobs, fetch_jobs
@@ -434,7 +536,8 @@ def create_app(data_dir: Path | None = None):
     app.state.store = store
     app.state.data_dir = data_dir
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
-    register_answer_memory_routes(app, store, invalidate)
+    register_answer_memory_routes(app, store, invalidate, continue_after_answer=continue_after_answer, on_profile_changed=rank_all)
+    register_onboarding_routes(app, store, invalidate, rank_all)
 
     @app.middleware("http")
     async def local_boundary(request, call_next):
@@ -473,6 +576,8 @@ def create_app(data_dir: Path | None = None):
         selected = selected_destinations(jobs)
         real_jobs = [job for job in jobs if not job.get("demo")]
         for job in real_jobs:
+            job["platform_support"] = platform_support(job)
+            job["platform_check_available"] = platform_check_problem(job) is None
             job["submission_check"] = submission_check(job, rules, profile)
             job["queue_actions"] = queue_actions(job, selected)
             job["unanswered_question_count"], job["conflicting_answer_count"] = unanswered_question_counts(job, profile)
@@ -485,7 +590,10 @@ def create_app(data_dir: Path | None = None):
             for field in ("description", "requirements", "required_skills", "preferred_skills", "published_pay", "pay_description"):
                 job.pop(field, None)
         return {
-            "profile": profile, "rules": rules,
+            "profile": profile, "profile_revision": profile_revision(profile), "rules": rules,
+            "onboarding": onboarding_state(profile, resume)["completion"],
+            "review_actions": application_review_actions(jobs),
+            "platforms": platform_catalog(),
             "resume": {"loaded": resume.get("loaded", False), "filename": resume.get("filename")},
             "approval": {"approved": valid_approval(profile, rules, resume, approval), "approved_at": approval.get("approved_at"),
                          "candidate_fingerprint": fingerprint(profile, rules, resume)},
@@ -551,7 +659,7 @@ def create_app(data_dir: Path | None = None):
             fields = inspected.get("fields") or []
             public_questions = plan_form(fields, {}, None).pending_questions
             profile = configuration()[0]
-            pending = plan_form(fields, profile, None).pending_questions
+            pending = plan_form(fields, profile, None, job=job).pending_questions
             if question is not None:
                 expected = _label(question)
                 selected = [item for item in public_questions if item["question"] == expected]
@@ -583,13 +691,69 @@ def create_app(data_dir: Path | None = None):
     async def lookup_question(job_id: str, body: QuestionLookupRequest):
         return await refresh_form_questions(job_id, question=body.question, query=body.query)
 
+    @app.post("/api/jobs/{job_id}/platform/check")
+    async def check_platform(job_id: str):
+        from .platform_checks import inspect_public_platform
+        from .question_lookup import inspect_questions
+
+        job = store.job(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found.")
+        support = platform_support(job)
+        problem = platform_check_problem(job)
+        if problem:
+            raise HTTPException(409, problem)
+        if worker_busy() or state["fetching"] or question_lock.locked():
+            raise HTTPException(409, "Wait for the active application, fetch or public check to finish.")
+        async with question_lock:
+            public_job = {"apply_url": job.get("apply_url")}
+            if support["automatic_submission_supported"]:
+                inspected = await inspect_questions(public_job)
+                from .platform_checks import _report
+                report = _report({"stage": inspected.get("status", "unavailable"), "fields": inspected.get("fields", []),
+                                  "gates": [] if inspected.get("status") == "inspected" else [inspected.get("message", "The form could not be fully read.")]}, support)
+                # Inspection itself never authorizes an application, even when
+                # this provider also has a separate guarded worker adapter.
+                report["automatic_submission_supported"] = True
+            else:
+                from .platform_checks import _report
+                report = _report(await inspect_public_platform(public_job), support)
+            fresh = store.job(job_id)
+            if (fresh is None or fresh.get("apply_url") != job.get("apply_url") or fresh.get("attempted_at")
+                    or platform_check_problem(fresh)):
+                raise HTTPException(409, "The application changed during its public check. No result or queue change was saved.")
+            report["checked_at"] = now()
+            store.update_job(job_id, fresh["status"], platform_check=report)
+            store.event("platform_check", "Public platform check completed without applicant details, uploads or submission.", job_id)
+            return report
+
     @app.post("/api/profile")
-    async def save_profile(profile: Profile):
-        store.set("profile", profile.model_dump())
-        invalidate()
-        rank_all()
-        store.event("profile", "Profile saved. Previous submission approval was revoked.")
-        return {"ok": True}
+    async def save_profile(profile: ProfileSaveRequest):
+        from .approval import material_profile
+        with store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value FROM config WHERE key='profile'").fetchone()
+            before = json.loads(row[0]) if row else Profile().model_dump()
+            if profile.expected_revision is not None and profile.expected_revision != profile_revision(before):
+                raise HTTPException(409, "The profile changed in another tab. Reload the latest profile before saving; your draft has not been saved.")
+            if "application_profile" in profile.model_fields_set and profile.expected_revision is None:
+                raise HTTPException(409, "Reload the profile before editing structured application details. A current profile revision is required.")
+            # Older dashboard versions omit new structured fields. Merge their
+            # explicit fields so a normal profile edit cannot erase education,
+            # work history or scoped answer bindings.
+            patch = profile.model_dump(exclude_unset=True, exclude={"expected_revision"})
+            updated = Profile.model_validate({**before, **patch}).model_dump()
+            changed = material_profile(before) != material_profile(updated)
+            connection.execute("INSERT OR REPLACE INTO config VALUES ('profile',?)", (json.dumps(updated),))
+            if changed:
+                for key, value in (("approval", {"approved": False, "approved_at": None}),
+                                   ("automation", {"enabled": False}), ("stop_requested", True)):
+                    connection.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (key, json.dumps(value)))
+        if changed:
+            invalidate()
+            rank_all()
+        store.event("profile", "Profile saved." + (" Previous submission approval was revoked." if changed else " Application details are unchanged."))
+        return {"ok": True, "changed": changed, "approval_required": changed, "profile_revision": profile_revision(updated)}
 
     @app.post("/api/rules")
     async def save_rules(rules: Rules):
@@ -657,7 +821,9 @@ def create_app(data_dir: Path | None = None):
             raise HTTPException(502, "Couldn't refresh the public job source. Saved jobs are still available.")
 
     @app.post("/api/run")
-    async def run_endpoint():
+    async def run_endpoint(expected_stop_generation: int | None = Query(default=None, ge=0)):
+        if expected_stop_generation is not None and expected_stop_generation != store.get("stop_generation", 0):
+            raise HTTPException(409, "Automation was stopped after answer confirmation. Use Run when you are ready to start again.")
         if not approved():
             raise HTTPException(409, "Approve your verified profile, resume and submission rules first.")
         if worker_busy():
@@ -688,15 +854,17 @@ def create_app(data_dir: Path | None = None):
             problems = configuration_problems(*configuration()[:3])
             if problems:
                 raise HTTPException(409, " ".join(problems))
-        store.set("automation", {"enabled": enabled})
-        store.set("stop_requested", not enabled)
+        if enabled:
+            store.set("automation", {"enabled": True})
+            store.set("stop_requested", False)
+        else:
+            manual_stop()
         store.event("automation", "Scheduled automation enabled while this app is running." if enabled else "Automation stopped; an in-flight click may already have completed. Check its recorded result.")
         return {"ok": True}
 
     @app.post("/api/run/stop")
     async def stop_run():
-        store.set("stop_requested", True)
-        store.set("automation", {"enabled": False})
+        manual_stop()
         tracker.request_stop()
         store.event("stop_requested", "Stop requested. No further submission will start; an application already sent cannot be undone.")
         return {"ok": True, "message": "Stop requested before the next submission. Scheduling is off."}

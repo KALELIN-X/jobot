@@ -7,11 +7,28 @@ from .destinations import SUPPORTED_ATS, parse_destination, verified_destination
 from .locations import location_matches
 from .models import company_scope
 
-POLICY_VERSION = 4
+POLICY_VERSION = 5
+
+
+def material_profile(profile):
+    """Only candidate values and answer scope affect submission approval.
+
+    Setup progress and confirmation timestamps are audit metadata. Normalize
+    optional schema defaults so completing a walkthrough or saving identical
+    answers does not force another approval.
+    """
+    from .models import Profile
+    values = Profile.model_validate(profile).model_dump()
+    application = values.get("application_profile", {})
+    application.pop("completed_steps", None)
+    application.pop("confirmed_at", None)
+    for binding in application.get("saved_answer_bindings", []):
+        binding.pop("confirmed_at", None)
+    return values
 
 
 def fingerprint(profile, rules, resume):
-    values = {"profile": profile, "rules": rules, "resume_sha256": resume.get("sha256"), "policy": POLICY_VERSION}
+    values = {"profile": material_profile(profile), "rules": rules, "resume_sha256": resume.get("sha256"), "policy": POLICY_VERSION}
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

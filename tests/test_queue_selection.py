@@ -1,5 +1,6 @@
 """Explicit local selection is separate from guarded application execution."""
 import asyncio
+import importlib
 import threading
 import time
 
@@ -17,6 +18,42 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
     with TestClient(create_app(tmp_path)) as client:
         yield client
+
+
+@pytest.fixture
+def scheduled_client(tmp_path, monkeypatch):
+    """Advance scheduler polling explicitly instead of racing its 5s timer.
+
+    Application selection, approvals, browser boundaries and all other async
+    waits remain real. Only the scheduler's polling tick is controlled here.
+    """
+    ticks = asyncio.Queue()
+
+    class SchedulerClock:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay):
+            task = asyncio.current_task()
+            if delay == 5 and task and task.get_coro().__qualname__.endswith(".<locals>.scheduler"):
+                await ticks.get()
+            else:
+                await asyncio.sleep(delay)
+
+    # Replace this module's asyncio reference, not asyncio.sleep globally: a
+    # global patch could accidentally accelerate worker/network timeouts too.
+    monkeypatch.setattr(importlib.import_module("jobradar.app"), "asyncio", SchedulerClock())
+
+    async def refreshed(job):
+        return {**job, "candidate_refresh": {"status": "verified", "message": "Synthetic official refresh"}}
+
+    monkeypatch.setattr("jobradar.refresh.refresh_candidate", refreshed)
+    with TestClient(create_app(tmp_path)) as test_client:
+        def advance():
+            assert test_client.portal is not None
+            test_client.portal.call(ticks.put_nowait, None)
+
+        yield test_client, advance
 
 
 def discovered(client, identifier, score=95):
@@ -285,7 +322,8 @@ def test_manual_run_never_picks_up_unselected_or_later_added_roles(client, monke
     assert client.app.state.store.job("later")["attempted_at"] is None
 
 
-def test_enabled_approved_schedule_selects_matching_roles_after_fetch(client, monkeypatch):
+def test_enabled_approved_schedule_selects_matching_roles_after_fetch(scheduled_client, monkeypatch):
+    client, advance_scheduler = scheduled_client
     configure_and_approve(client)
     discovered(client, "scheduled")
     saved = client.app.state.store.job("scheduled")
@@ -316,6 +354,7 @@ def test_enabled_approved_schedule_selects_matching_roles_after_fetch(client, mo
     monkeypatch.setattr("jobradar.autofill.run_application", synthetic_browser)
     try:
         assert client.post("/api/automation", headers=HEADERS, json={"enabled": True}).status_code == 200
+        advance_scheduler()
         assert reached.wait(8), "Approved scheduled fetch never selected the matching discovered role"
         await_idle(client)
     finally:
@@ -327,7 +366,8 @@ def test_enabled_approved_schedule_selects_matching_roles_after_fetch(client, mo
     assert client.app.state.store.job("unsupported")["status"] == "new"
 
 
-def test_configuration_change_during_scheduled_fetch_prevents_auto_selection(client, monkeypatch):
+def test_configuration_change_during_scheduled_fetch_prevents_auto_selection(scheduled_client, monkeypatch):
+    client, advance_scheduler = scheduled_client
     configure_and_approve(client)
     discovered(client, "scheduled")
     saved = client.app.state.store.job("scheduled")
@@ -345,6 +385,7 @@ def test_configuration_change_during_scheduled_fetch_prevents_auto_selection(cli
     monkeypatch.setattr("jobradar.autofill.run_application", unexpected_browser)
     try:
         assert client.post("/api/automation", headers=HEADERS, json={"enabled": True}).status_code == 200
+        advance_scheduler()
         assert entered.wait(8)
         assert client.post("/api/profile", headers=HEADERS, json={**PROFILE, "email": "changed@example.test"}).status_code == 200
     finally:

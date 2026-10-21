@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlsplit
 from .destinations import GREENHOUSE_HOSTS, LEVER_HOSTS, parse_destination
 from .form_adapters import GreenhouseTransport, SNAPSHOT_JS, choose_combobox, enrich_comboboxes
 from .progress import ProgressCallback, ProgressReporter
+from .question_intents import RECORD_INTENTS, classify_question, field_answer, protected_question, resolve_question
 
 
 _APPLY_PATH = re.compile(
@@ -181,7 +182,7 @@ class FormPlan:
 
 def reusable_question(question: str) -> bool:
     """Only ordinary questions belong in reusable memory, never challenges or agreements."""
-    return bool(question and len(question) <= 500 and not _LEGAL.search(question) and not _PRIVATE_CHALLENGE.search(question))
+    return bool(question and len(question) <= 500 and not protected_question(question) and not _PRIVATE_CHALLENGE.search(question))
 
 
 def searchable_lookup(item: dict) -> bool:
@@ -217,6 +218,8 @@ def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[
             "key": question, "question": question, "type": kind,
             "required": bool(item.get("required")), "options": choices[:300], "reason": reason,
         }
+        if item.get("ambiguous_record_control"):
+            candidate.update(ambiguous_record_control=True, record_control_name=str(item.get("name") or item.get("id") or "")[:200])
         if item.get("combobox") and item.get("searchable") is True and not item.get("multiple"):
             candidate.update(searchable=True, lookup_required=searchable_lookup(item))
             minimum = item.get("minimum_query_length")
@@ -226,7 +229,7 @@ def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[
                 candidate["lookup_query_hash"] = lookup_query_hash(lookup_query)
         # Repeated scans of the same question can be collapsed, but two
         # distinct controls with the same label must remain visibly ambiguous.
-        signature_keys = ("question", "type", "required", "options", "searchable", "lookup_required", "minimum_query_length")
+        signature_keys = ("question", "type", "required", "options", "searchable", "lookup_required", "minimum_query_length", "ambiguous_record_control", "record_control_name")
         signature = {key: candidate.get(key) for key in signature_keys}
         if any(all(previous.get(key) == value for key, value in signature.items()) for previous in plan.pending_questions):
             return
@@ -234,74 +237,9 @@ def _pending_question(plan: FormPlan, item: dict, *, reason: str, options: list[
         plan.pending_questions.append(candidate)
 
 
-def _answer(item: dict, profile: dict) -> Any:
-    """Return only explicitly provided facts; never infer first/last name, etc."""
-    label = _label(item.get("label"))
-    answers = profile.get("answers") or {}
-    if isinstance(answers, dict) and label in answers:
-        return answers[label]
-    # A supplied graduation month can answer month/year fields, but never
-    # manufacture a day for a full-date field.
-    graduation = profile.get("graduation_month")
-    question = _normal(label)
-    if isinstance(graduation, str) and re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", graduation):
-        year, month = graduation.split("-")
-        if question in {"graduation month", "expected graduation month"}:
-            if item.get("type") == "month":
-                return graduation
-            if item.get("type") == "number":
-                return str(int(month))
-            choices = {month, str(int(month)), calendar.month_name[int(month)], calendar.month_abbr[int(month)]}
-            available = [option for option in item.get("options", []) if option.get("label") in choices or str(option.get("value")) in choices]
-            return available[0]["label"] if len(available) == 1 else calendar.month_name[int(month)]
-        if question in {"graduation year", "expected graduation year"}:
-            return year
-        if item.get("type") == "month" and question in {"graduation date", "expected graduation date", "graduation month year"}:
-            return graduation
-    name_aliases = {
-        "name": {"name", "full name", "fullname", "your name", "legal name", "full legal name"},
-        "first_name": {"first name", "firstname", "given name", "givenname", "legal first name", "legal given name"},
-        "last_name": {"last name", "lastname", "family name", "familyname", "surname", "legal last name", "legal family name"},
-        "preferred_first_name": {"preferred first name", "preferredfirstname", "preferred given name"},
-    }
-    # A visible name label takes precedence over an ambiguous input name. Never
-    # split, concatenate, or substitute legal and preferred names for one another.
-    for identifier in (_normal(label), _normal(item.get("name"))):
-        for key, candidates in name_aliases.items():
-            if identifier in candidates:
-                return profile.get(key)
-    names = {_normal(label), _normal(item.get("name"))}
-    aliases = {
-        "email": {"email", "email address", "emailaddress", "your email"},
-        "phone": {"phone", "phone number", "phonenumber", "telephone", "mobile phone"},
-        "location": {"location", "current location", "currentlocation", "location city", "city country"},
-        "current_company": {"current company", "currentcompany", "current employer", "organization"},
-        "linkedin": {"linkedin", "linkedin url", "linkedin profile", "urls linkedin"},
-        "github": {"github", "github url", "github profile", "urls github"},
-        "portfolio": {"portfolio", "portfolio url", "personal website", "website", "urls portfolio"},
-        "graduation_date": {"graduation date", "graduationdate", "expected graduation date"},
-        "experience_months": {"experience months", "months of experience", "experience in months"},
-        "skills": {"skills", "technical skills"},
-    }
-    for key, candidates in aliases.items():
-        if names & candidates and key in profile:
-            value = profile[key]
-            if key == "skills" and isinstance(value, list) and all(isinstance(v, str) for v in value):
-                return ", ".join(value)
-            return value
-    question = _normal(label)
-    if (
-        re.search(r"\b(?:legally )?authorized to work\b", question)
-        or question in {"work authorization", "work authorized"}
-    ) and type(profile.get("work_authorized")) is bool and _us_or_unspecified_authorization(question):
-        return profile["work_authorized"]
-    if (
-        "sponsorship" in question
-        and re.search(r"\b(?:need|require|requires|will|now|future)\b", question)
-        and type(profile.get("needs_sponsorship")) is bool
-    ):
-        return profile["needs_sponsorship"]
-    return None
+def _answer(item: dict, profile: dict, job: dict | None = None) -> Any:
+    """Use the same confirmed-fact resolver as readiness and answer memory."""
+    return field_answer(resolve_question(item, profile, job), item)
 
 
 def _option_match(options: list[dict], answer: Any) -> dict | None:
@@ -315,6 +253,12 @@ def _option_match(options: list[dict], answer: Any) -> dict | None:
             if not o.get("disabled")
             and (str(o.get("label", "")).strip() == expected or str(o.get("value", "")) == expected)
         ]
+        if not matches:
+            # Case/whitespace formatting is harmless, but do not fuzz words,
+            # numbers, punctuation, geography, or opaque option identifiers.
+            matches = [o for o in options if not o.get("disabled") and
+                       re.sub(r"\s+", " ", str(o.get("label") or "")).strip().casefold() ==
+                       re.sub(r"\s+", " ", expected).strip().casefold()]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -335,7 +279,7 @@ def _phone_country_option(item: dict, answer: Any, profile: dict) -> dict | None
     return matches[0] if len(matches) == 1 else None
 
 
-def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None) -> FormPlan:
+def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None, job: dict | None = None) -> FormPlan:
     """Build safe actions and human-review blockers from a DOM field snapshot.
 
     Metadata records use ``id, label, name, type, tag, required, visible,
@@ -344,7 +288,14 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
     """
     plan = FormPlan()
     radios: dict[str, list[dict]] = {}
+    record_labels = {}
     for item in fields:
+        if item.get("visible", True) and not item.get("disabled") and classify_question(item).intent_id in RECORD_INTENTS:
+            label = _normal(_label(item.get("label")))
+            record_labels[label] = record_labels.get(label, 0) + 1
+    for item in fields:
+        if record_labels.get(_normal(_label(item.get("label"))), 0) > 1 and classify_question(item).intent_id in RECORD_INTENTS:
+            item = {**item, "ambiguous_record_control": True}
         kind = str(item.get("type", "text")).lower()
         if item.get("disabled") or kind in {"hidden", "submit", "reset", "button", "image"}:
             continue
@@ -356,7 +307,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         name = _label(item.get("name"))
         description = label or name or "Unlabelled field"
         required = bool(item.get("required"))
-        if _LEGAL.search(label + " " + name) and (required or kind in {"checkbox", "radio"}):
+        if protected_question(label + " " + name) and not _PRIVATE_CHALLENGE.search(label + " " + name) and (required or kind in {"checkbox", "radio"}):
             plan.blockers.append(f"Human review required for declaration or agreement: {description[:160]}")
             continue
         if _PRIVATE_CHALLENGE.search(label + " " + name):
@@ -377,7 +328,7 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             elif required:
                 plan.blockers.append(f"A supplied file is required: {description[:160]}")
             continue
-        answer = _answer(item, profile)
+        answer = _answer(item, profile, job)
         if answer is None or answer == "" or isinstance(answer, (dict, list, tuple, set)):
             _pending_question(plan, item, reason="lookup_query_required" if searchable_lookup(item) else "missing_answer")
             if required:
@@ -386,7 +337,8 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         if kind == "checkbox":
             if type(answer) is not bool:
                 _pending_question(plan, item, reason="boolean_required")
-                plan.blockers.append(f"An explicit boolean answer is required: {description[:160]}")
+                if required:
+                    plan.blockers.append(f"An explicit boolean answer is required: {description[:160]}")
             elif required and not answer:
                 _pending_question(plan, item, reason="required_checkbox_conflict")
                 plan.blockers.append(f"Required checkbox conflicts with the approved answer: {description[:160]}")
@@ -397,7 +349,8 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
             if option is None or str(option.get("value", "")) == "":
                 _pending_question(plan, item, reason="lookup_no_exact_choice" if searchable_lookup(item) else "choice_unavailable",
                                   lookup_query=answer if isinstance(answer, str) else None)
-                plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
+                if required:
+                    plan.blockers.append(f"No exact available choice for approved answer: {description[:160]}")
             elif item.get("combobox"):
                 if _label(item.get("selected_label")) != _label(option["label"]):
                     plan.actions.append(FieldAction(item["id"], "combobox", str(option["label"])))
@@ -406,7 +359,8 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
         elif kind in {"text", "email", "tel", "url", "number", "date", "month", "search", "textarea"}:
             if isinstance(answer, bool):
                 _pending_question(plan, item, reason="text_required")
-                plan.blockers.append(f"A typed answer needs human review: {description[:160]}")
+                if required:
+                    plan.blockers.append(f"A typed answer needs human review: {description[:160]}")
             elif str(item.get("value", "")) != str(answer):
                 plan.actions.append(FieldAction(item["id"], "fill", str(answer)))
         else:
@@ -415,12 +369,12 @@ def plan_form(fields: list[dict], profile: dict, resume_path: Path | None = None
     for group in radios.values():
         example = group[0]
         label = _label(example.get("label")) or _label(example.get("name"))
-        answer = _answer(example, profile)
+        answer = _answer(example, profile, job)
         options = [dict(i, label=i.get("option_label", i.get("value", ""))) for i in group]
         selected = _option_match(options, answer) if answer is not None else None
         if selected is None:
             _pending_question(plan, dict(example, required=any(i.get("required") for i in group)), reason="missing_choice", options=options)
-            if any(i.get("required") for i in group) or answer is not None:
+            if any(i.get("required") for i in group):
                 plan.blockers.append(f"No exact approved choice for required question: {label[:160]}")
         elif not selected.get("checked"):
             plan.actions.append(FieldAction(selected["id"], "check", True))
@@ -647,14 +601,14 @@ async def run_application(
                                 # upload, even if the renderer reset its input.
                                 field["has_file"] = True
                     if not current.get("captcha") and not current.get("login") and not _DECLARATION.search(current.get("body", "")):
-                        current = await enrich_comboboxes(page, current, lambda item: _answer(item, profile))
+                        current = await enrich_comboboxes(page, current, lambda item: _answer(item, profile, job))
                     return current
 
                 state = await snapshot()
                 for _ in range(3):
                     await emit_progress("checking_answers")
                     blockers = _form_blockers(state, url, allowed_hosts, fixture)
-                    plan = plan_form(state["fields"], profile, resume_path)
+                    plan = plan_form(state["fields"], profile, resume_path, job=job)
                     pending_questions = plan.pending_questions
                     blockers += plan.blockers
                     if blockers:
@@ -698,7 +652,7 @@ async def run_application(
                     return await result("needs_attention", "The application kept changing while fields were filled.")
 
                 await emit_progress("checking_answers")
-                final_plan = plan_form(state["fields"], profile, resume_path)
+                final_plan = plan_form(state["fields"], profile, resume_path, job=job)
                 pending_questions = final_plan.pending_questions
                 blockers = _form_blockers(state, url, allowed_hosts, fixture) + final_plan.blockers
                 if final_plan.actions or blockers:
