@@ -80,7 +80,7 @@ No credentials or verification codes are added to profile storage. Applicant ide
 
 The SQLite database, resume uploads, and screenshots remain in the ignored local data directory. They are private plaintext files protected by the user's operating-system account, not an encrypted multi-user service. Keep them out of Git. Back up the complete data directory with the app stopped when moving installations; a fresh clone has no knowledge of prior applications.
 
-Automatic form adapters remain limited to the tested Lever/Greenhouse layouts. This release does not add Workday/Ashby account flows, hosted user accounts, email integration, or an external AI service. Existing application history is retained. The new matching policy requires a fresh reviewed approval after upgrade.
+The [platform support guide](PLATFORM_SUPPORT.md) describes the five bounded application adapters and their limits. Ashby, SmartRecruiters and Workday can retain a live application browser for explicit user verification/review and resume; this does not provide autonomous account creation, hosted user accounts, email integration or an external AI service. Existing application history is retained. The new matching policy requires a fresh reviewed approval after upgrade.
 
 ## Extending and testing
 

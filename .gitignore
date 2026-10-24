@@ -13,3 +13,19 @@ __pycache__/
 *.log
 .coverage
 htmlcov/
+
+# Personal documents and browser/session exports do not belong in the source repo.
+*[Rr]esume*.pdf
+*[Tt]ranscript*.pdf
+/profile.json
+/application-profile.json
+/answers.json
+credentials*.json
+cookies*.json
+storage-state*.json
+*.har
+/.auth/
+/artifacts/
+/application-artifacts/
+/browser-profiles/
+/private/

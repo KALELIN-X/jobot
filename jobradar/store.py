@@ -127,7 +127,7 @@ class Store:
                 previous = json.loads(existing["payload"])
                 # Discovery refreshes source fields, but cannot erase a worker's
                 # questions or recorded delivery evidence while the owner reviews it.
-                runtime_fields = {key: previous[key] for key in ("pending_questions", "form_questions", "questions_refreshed_at", "confirmation", "message", "error", "applied_at", "screenshot")
+                runtime_fields = {key: previous[key] for key in ("pending_questions", "form_questions", "questions_refreshed_at", "confirmation", "message", "error", "applied_at", "screenshot", "verification")
                                   if key in previous}
                 job = {**job, **runtime_fields}
             key = application_key(job)
@@ -151,9 +151,9 @@ class Store:
         """
         key = application_key({"apply_url": url}) if url is not None else None
         if url is not None and key is None:
-            raise ValueError("Enter an HTTPS Lever or Greenhouse posting URL with a valid posting ID.")
+            raise ValueError("Enter a supported HTTPS employer posting URL with a valid posting ID.")
         if url is None and job_id is None:
-            raise ValueError("Provide a saved job ID or an HTTPS Lever or Greenhouse posting URL.")
+            raise ValueError("Provide a saved job ID or a supported HTTPS employer posting URL.")
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             identity_key = None

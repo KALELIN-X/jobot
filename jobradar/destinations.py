@@ -16,7 +16,7 @@ GREENHOUSE_HOSTS = frozenset({
     "boards.eu.greenhouse.io", "job-boards.eu.greenhouse.io",
 })
 SUPPORTED_HOSTS = LEVER_HOSTS | GREENHOUSE_HOSTS
-SUPPORTED_ATS = frozenset({"lever", "greenhouse"})
+SUPPORTED_ATS = frozenset({"lever", "greenhouse", "ashby", "smartrecruiters", "workday"})
 JOBRIGHT_SOURCE_URL = "https://raw.githubusercontent.com/jobright-ai/2026-Software-Engineer-New-Grad/master/README.md"
 SIMPLIFY_SOURCE_URL = "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md"
 _BOARD = r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}"
@@ -37,6 +37,9 @@ def parse_destination(url) -> dict | None:
     try:
         parts = urlsplit(url)
         host = parts.hostname
+        if host not in SUPPORTED_HOSTS:
+            from .extended_destinations import parse_extended_destination
+            return parse_extended_destination(url)
         if (parts.scheme != "https" or host not in SUPPORTED_HOSTS
                 or parts.username or parts.password or parts.port not in (None, 443)
                 or parts.fragment or unquote(parts.path) != parts.path):
@@ -89,6 +92,9 @@ def public_detail_url(destination) -> str | None:
     if parsed["ats"] == "lever":
         api_host = "api.eu.lever.co" if parsed["host"] == "jobs.eu.lever.co" else "api.lever.co"
         return f"https://{api_host}/v0/postings/{parsed['board']}/{parsed['posting_id']}"
+    if parsed["ats"] not in {"lever", "greenhouse"}:
+        from .extended_destinations import extended_public_detail_url
+        return extended_public_detail_url(parsed)
     return (f"https://boards-api.greenhouse.io/v1/boards/{parsed['board']}/jobs/{parsed['posting_id']}"
             "?content=true&pay_transparency=true")
 

@@ -7,7 +7,7 @@ from .destinations import SUPPORTED_ATS, parse_destination, verified_destination
 from .locations import location_matches
 from .models import company_scope
 
-POLICY_VERSION = 5
+POLICY_VERSION = 6
 
 
 def material_profile(profile):
@@ -53,7 +53,7 @@ def setup_problems(profile, rules, resume):
     if company_scope(rules) == "selected" and not rules.get("companies"):
         problems.append("Choose at least one employer for selected-company mode, or allow any fetched company.")
     if not set(rules.get("allowed_ats", [])) & SUPPORTED_ATS:
-        problems.append("Enable Lever or Greenhouse applications in Rules before approving automatic submissions.")
+        problems.append("Enable a supported application platform in Rules before approving automatic submissions.")
     return problems
 
 
@@ -66,7 +66,7 @@ def job_problems(job, rules):
         problems.append("Employer is outside your approved company list.")
     ats = job.get("ats")
     if ats not in SUPPORTED_ATS:
-        problems.append("Only supported verified Lever or Greenhouse application forms can run automatically.")
+        problems.append("Only supported verified employer application forms can run automatically.")
     elif ats not in rules.get("allowed_ats", []):
         problems.append(f"{ats.title()} applications are disabled in your saved rules.")
     parsed = parse_destination(job.get("apply_url"))

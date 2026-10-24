@@ -130,13 +130,13 @@ def test_supported_system_can_be_disabled_and_closed_postings_cannot_run():
 
 
 def test_new_ats_defaults_do_not_widen_explicitly_saved_lever_only_rules():
-    assert Rules().allowed_ats == ["lever", "greenhouse"]
+    assert Rules().allowed_ats == ["lever", "greenhouse", "ashby", "smartrecruiters", "workday"]
     assert Rules(allowed_ats=["lever"]).allowed_ats == ["lever"]
     assert Rules(allowed_ats=["greenhouse"]).allowed_ats == ["greenhouse"]
     assert Rules(allowed_ats=[]).allowed_ats == []
 
 
-@pytest.mark.parametrize("systems", [["workday"], ["ashby"], ["lever", "lever"], ["greenhouse", "unknown"]])
+@pytest.mark.parametrize("systems", [["icims"], ["taleo"], ["lever", "lever"], ["greenhouse", "unknown"]])
 def test_unsupported_or_duplicate_ats_rules_are_rejected(systems):
     from pydantic import ValidationError
     with pytest.raises(ValidationError):

@@ -58,7 +58,10 @@
       const posting = /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/apply)?\/?$/i;
       const greenhouse = ["boards.greenhouse.io","job-boards.greenhouse.io","boards.eu.greenhouse.io","job-boards.eu.greenhouse.io"].includes(url.hostname) && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/jobs\/[0-9]+\/?$/.test(url.pathname);
       const lever = ["jobs.lever.co","jobs.eu.lever.co"].includes(url.hostname) && posting.test(url.pathname);
-      return url.protocol === "https:" && (lever || greenhouse) && !url.username && !url.password && (!url.port || url.port === "443") ? url.href : null;
+      const ashby = url.hostname === "jobs.ashbyhq.com" && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/application)?\/?$/i.test(url.pathname);
+      const smart = ["jobs.smartrecruiters.com","www.smartrecruiters.com"].includes(url.hostname) && /^\/[A-Za-z0-9][A-Za-z0-9_-]*\/[1-9][0-9]*(?:-[A-Za-z0-9_-]+)?\/?$/.test(url.pathname);
+      const workday = /^[a-z0-9-]+\.wd[0-9]{1,2}\.myworkdayjobs\.com$/.test(url.hostname) && !/%2f|%5c|%25/i.test(url.pathname) && /^\/(?:[a-z]{2}-[A-Z]{2}\/)?[A-Za-z0-9_-]+\/job\/(?:[^/]+\/)?[^/]+_[A-Za-z]{0,8}-?[0-9]{3,20}(?:-[0-9]+)?(?:\/apply(?:\/applyManually)?)?\/?$/.test(url.pathname);
+      return url.protocol === "https:" && (lever || greenhouse || ashby || smart || workday) && !url.username && !url.password && (!url.port || url.port === "443") ? url.href : null;
     } catch { return null; }
   }
   function externalLink(url, label, className = "button button-secondary") {
@@ -212,7 +215,7 @@
     return (Number.isFinite(Number(b.score)) && b.score !== null ? Number(b.score) : -1) - (Number.isFinite(Number(a.score)) && a.score !== null ? Number(a.score) : -1);
   }
   function renderJobs(force = false) {
-    const signature = JSON.stringify([state.jobs,state.rules,state.answer_memory?.pending,state.run?.updated_at,filter,search,experienceFilterEnabled]);
+    const signature = JSON.stringify([state.jobs,state.rules,state.answer_memory?.pending,state.run?.updated_at,filter,search,experienceFilterEnabled,state.approval,dirty,onboardingDirty]);
     if (!force && signature === lastJobSignature) return;
     lastJobSignature = signature;
     const allJobs = list(state.jobs);
@@ -240,7 +243,9 @@
       $("#job-list").innerHTML = `<div class="simple-empty">${icon("search")}<h3>No roles in this view</h3><p>${search ? "Try another role or company name." : maximum !== null && experienceFilterEnabled ? "Turn off the experience filter or choose another view to review more roles, including unknown requirements." : "Choose All roles to see the rest of your opportunities."}</p><button type="button" class="text-button" data-action="clear-filter" style="margin-top:18px">Show all roles</button></div>`;
       return;
     }
+    const acknowledgments = new Set([...($("#job-list").querySelectorAll?.(".verification-card") || [])].filter(card => card.querySelector(".verification-ack")?.checked).map(card => `${card.dataset.id}|${card.dataset.pause}`));
     $("#job-list").innerHTML = jobs.map(jobCard).join("");
+    $("#job-list").querySelectorAll(".verification-card").forEach(card => { const checkbox = card.querySelector(".verification-ack"); if (checkbox && acknowledgments.has(`${card.dataset.id}|${card.dataset.pause}`)) checkbox.checked = true; });
   }
   function queueCardAction(job) {
     if (job.queue_actions?.can_add === true) return {kind:"add",label:"Add to queue",reason:""};
@@ -264,7 +269,7 @@
   }
   function platformMode(support) {
     if (!support || typeof support !== "object") return {label:"Support not checked",className:"unknown"};
-    if (support.automatic_submission_supported === true && ["lever","greenhouse"].includes(support.platform)) return {label:"Automatic applications",className:"automatic"};
+    if (support.automatic_submission_supported === true && ["lever","greenhouse","ashby","smartrecruiters","workday"].includes(support.platform)) return {label:support.resumable ? "Applications with pause & resume" : "Automatic applications",className:support.resumable ? "resumable" : "automatic"};
     return support.can_inspect === true ? {label:"Read-only check · manual application",className:"inspection"} : {label:"Manual application",className:"manual"};
   }
   function canCheckPlatform(job) {
@@ -284,12 +289,37 @@
     const mode = platformMode(support);
     return `<section class="job-platform-support" aria-label="Application platform compatibility"><div class="platform-support-heading"><span class="detail-label">${escape(support?.label || String(job.ats || "Unknown platform"))}</span><span class="platform-mode ${mode.className}">${mode.label}</span></div><p>${escape(support?.reason || "Platform compatibility has not been reported. Open the employer form to review it.")}</p>${support?.next_action ? `<p class="platform-next-action">${escape(support.next_action)}</p>` : ""}${platformReportMarkup(job.platform_check)}</section>`;
   }
+  function canResumeApplication(job) {
+    const receipt = job.verification;
+    return !isDemo(job) && job.status === "needs_attention" && !job.attempted_at && !(Number(job.attempts) > 0)
+      && receipt?.state === "paused" && /^[a-f0-9]{48}$/.test(receipt.session_id || "") && /^[a-f0-9]{32}$/.test(receipt.pause_id || "")
+      && job.resume_available === true && state.approval?.approved === true && /^[a-f0-9]{64}$/.test(state.approval.candidate_fingerprint || "")
+      && !dirty.profile && !dirty.rules && !onboardingDirty;
+  }
+  function verificationMarkup(job) {
+    const receipt = job.verification;
+    if (!receipt || !["paused","resuming","interrupted"].includes(receipt.state)) return "";
+    const canResume = canResumeApplication(job);
+    return `<section class="verification-card" data-id="${escape(String(job.id))}" data-pause="${escape(receipt.pause_id || "")}" aria-label="Application waiting for you"><strong>${receipt.state === "resuming" ? "Resuming application" : "Application needs your action"}</strong><p>${escape(receipt.message || "Review the step in the separate Jobot browser.")}</p><p>${escape(receipt.next_action || "The previous browser ended. Review the employer draft before starting a fresh session.")}</p>${receipt.state === "paused" ? `<label class="checkbox-field"><input type="checkbox" class="verification-ack"><span>I completed this step and reviewed the current answers in the Jobot application browser. Resume this application.</span></label><div class="detail-actions"><button type="button" class="button button-secondary" data-action="focus-application" data-id="${escape(String(job.id))}">Show application browser</button><button type="button" class="button button-primary" data-action="resume-application" data-id="${escape(String(job.id))}" ${canResume ? "" : "disabled"}>Resume application</button><button type="button" class="button button-secondary" data-action="cancel-application" data-id="${escape(String(job.id))}">Close application browser</button></div>${!canResume ? '<p>Resume requires a live unattempted browser and unchanged approved settings. Close an expired browser receipt before queueing the role again.</p>' : ""}` : ""}<small>Complete login or verification yourself. Do not submit manually in this browser. Closing it does not delete an employer-side draft.</small></section>`;
+  }
+  function renderVerification() {
+    const target = $("#application-verification-list");
+    if (!target) return;
+    const jobs = list(state.jobs).filter(job => ["paused","resuming","interrupted"].includes(job.verification?.state));
+    const signature = JSON.stringify([jobs.map(job => [job.id,job.status,job.attempted_at,job.verification,job.resume_available]),state.approval,dirty,onboardingDirty]);
+    if (target.dataset.signature === signature) return;
+    const acknowledged = new Set([...target.querySelectorAll(".verification-card")].filter(card => card.querySelector(".verification-ack")?.checked).map(card => `${card.dataset.id}|${card.dataset.pause}`));
+    target.innerHTML = jobs.map(job => `<div class="verification-role"><h3>${escape(job.company)} · ${escape(job.title)}</h3>${verificationMarkup(job)}</div>`).join("") || '<p class="detail-empty">No application browsers are waiting for you.</p>';
+    target.querySelectorAll(".verification-card").forEach(card => { const checkbox = card.querySelector(".verification-ack"); if (checkbox && acknowledged.has(`${card.dataset.id}|${card.dataset.pause}`)) checkbox.checked = true; });
+    target.dataset.signature = signature;
+  }
   function platformCatalogMarkup(platforms) {
     const entries = list(platforms);
     if (!entries.length) return '<p class="platform-check-note">Platform compatibility will appear after the local server returns its support list.</p>';
     const automatic = entries.filter(item => platformMode(item).className === "automatic").length;
+    const resumable = entries.filter(item => platformMode(item).className === "resumable").length;
     const inspectable = entries.filter(item => platformMode(item).className === "inspection").length;
-    return `<details class="platform-catalog"><summary>${automatic} automatic · ${inspectable} inspection-only · ${entries.length - automatic - inspectable} manual <span>View platform details</span></summary><ul>${entries.map(item => {
+    return `<details class="platform-catalog"><summary>${automatic} automatic · ${resumable} with pause &amp; resume${inspectable ? ` · ${inspectable} inspection-only` : ""} · ${entries.length - automatic - resumable - inspectable} manual <span>View platform details</span></summary><ul>${entries.map(item => {
       const mode = platformMode(item);
       return `<li><div><strong>${escape(item.label || item.platform || "Unknown platform")}</strong><span class="platform-mode ${mode.className}">${mode.label}</span></div><p>${escape(item.reason || "Open the employer form for manual review.")}</p>${item.next_action ? `<p class="platform-next-action">${escape(item.next_action)}</p>` : ""}</li>`;
     }).join("")}</ul></details>`;
@@ -341,7 +371,7 @@
       ${!isDemo(job) ? jobFactsMarkup(job) : ""}
       <div class="job-card-bottom"><div class="job-tags"><span class="tag ${statusClass}">${escape(statusLabel)}</span>${job.submission_check?.matches_rules === true ? '<span class="tag success">Matches rules</span>' : ""}${job.ats && !isDemo(job) ? `<span class="tag">${escape(String(job.ats).toUpperCase())}</span>` : ""}${detail.is_new_grad === true ? '<span class="tag">New grad / entry level</span>' : ""}${isDemo(job) ? '<span class="tag demo">LOCAL DEMO</span>' : ""}</div><button type="button" class="details-toggle" data-action="details" data-id="${escape(id)}" aria-expanded="${open}" aria-controls="${escape(detailId)}">${open ? "Less detail" : "Checks & details"}${icon("chevron")}</button></div>
       ${quickActions}${observed}
-      <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${jobPlatformMarkup(job)}${preflight}
+      <div class="job-detail" id="${escape(detailId)}" ${open ? "" : "hidden"}>${isDemo(job) ? '<div class="demo-banner">Demo uses a local mock employer. No real employer receives this application.</div>' : ""}${job.error && !["submitted","dismissed","applied_elsewhere"].includes(status) ? `<div class="job-error">${escape(job.error)}</div>` : ""}${submissionInfo ? `<div class="submission-confirmation"><div class="detail-label">Submission confirmation</div><p>${escape(submissionInfo)}</p></div>` : ""}${verificationMarkup(job)}${jobPlatformMarkup(job)}${preflight}
         <details class="fit-explanation"><summary>Score evidence & eligibility</summary><div class="detail-columns"><div><div class="detail-label">Resume matches</div>${evidence(detail.matches)}</div><div><div class="detail-label">Not evidenced</div>${evidence(detail.not_evidenced)}</div></div><div class="detail-label">Eligibility checks</div><div class="eligibility-list">${eligibility || '<p class="detail-empty">Eligibility has not been assessed. Review the role before applying.</p>'}</div>${list(detail.reasons).length ? `<div class="detail-label">Scoring notes</div>${evidence(detail.reasons)}` : ""}${sourceEvidence.length ? `<div class="detail-label">Job fact source excerpts</div>${evidence([...new Set(sourceEvidence)])}` : ""}</details>
         ${priorApplicationHelp}<div class="detail-actions">${externalLink(job.detail_url || job.apply_url,"Open role")}${job.apply_url && job.apply_url !== job.detail_url ? externalLink(job.apply_url,"Application form") : ""}${canCheckPlatform(job) ? `<button type="button" class="button button-secondary" data-action="check-platform" data-id="${escape(id)}">Check platform</button>` : ""}${canRefreshQuestions ? `<button type="button" class="button button-secondary" data-action="refresh-questions" data-id="${escape(id)}">Refresh form questions</button>` : ""}${job.browser_capture_available ? `<a class="button button-secondary" href="/api/jobs/${encodeURIComponent(id)}/screenshot" target="_blank" rel="noopener">Last browser capture ${icon("external")}</a>` : ""}${canRecordApplied ? `<button type="button" class="button button-secondary" data-action="applied-elsewhere" data-id="${escape(id)}">Already applied${icon("check")}</button>` : ""}${!hideJobActions && !isSubmitted && status !== "dismissed" ? `<button type="button" class="text-button" data-action="dismiss" data-id="${escape(id)}">Dismiss role</button>` : ""}</div></div></article>`;
   }
@@ -350,7 +380,7 @@
     const resumeReady = Boolean(state.resume?.loaded);
     const companies = list(state.rules?.companies);
     const anyCompany = companyScope(state.rules) === "any";
-    const rulesReady = (anyCompany || companies.length > 0) && list(state.rules?.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats));
+    const rulesReady = (anyCompany || companies.length > 0) && list(state.rules?.allowed_ats).some(ats => ["lever","greenhouse","ashby","smartrecruiters","workday"].includes(ats));
     const approved = Boolean(state.approval?.approved);
     $("#readiness-title").textContent = approved ? "Ready when you are" : "Before your first run";
     $("#readiness-description").textContent = approved ? "Your saved rules are approved. You decide when to put them to work." : "A few essentials keep every application intentional.";
@@ -420,7 +450,7 @@
     if (!snapshot.resume?.loaded) return {view:"profile",selector:"#resume-file"};
     const companies = list(snapshot.rules?.companies);
     if (companyScope(snapshot.rules) === "selected" && !companies.length) return {view:"rules",selector:'#rules-form [name="companies"]'};
-    if (!list(snapshot.rules?.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats))) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
+    if (!list(snapshot.rules?.allowed_ats).some(ats => ["lever","greenhouse","ashby","smartrecruiters","workday"].includes(ats))) return {view:"rules",selector:'#rules-form [name="allowed_ats"]'};
     return {view:"rules",selector:snapshot.approval?.approved ? '#rules-form [name="min_score"]' : "#approval-acknowledge"};
   }
   function openQueueReview() {
@@ -902,6 +932,7 @@
     (choice ? form.elements.choice : form.elements.answer).focus({preventScroll:true});
   }
   function renderActivity() {
+    renderVerification();
     const events = list(state.events);
     const signature = JSON.stringify(events);
     if (signature === lastEventSignature) return;
@@ -951,7 +982,7 @@
       rulesForm.elements.prefer_new_grad.checked = rules.prefer_new_grad === true;
       rulesForm.elements.enforce_graduation_window.checked = rules.enforce_graduation_window !== false;
       rulesForm.elements.require_known_eligibility.checked = rules.require_known_eligibility !== false;
-      rulesForm.elements.allowed_ats.checked = list(rules.allowed_ats).some(ats => ["lever","greenhouse"].includes(ats));
+      rulesForm.elements.allowed_ats.checked = list(rules.allowed_ats).some(ats => ["lever","greenhouse","ashby","smartrecruiters","workday"].includes(ats));
       $("#score-output").value = rulesForm.elements.min_score.value;
       initialized.rules = true;
     }
@@ -1120,6 +1151,21 @@
     } else if (name === "refresh-questions") {
       const form = button.closest(".activity-answer-form");
       action(`questions-${id}`,button,() => form ? post(`/api/jobs/${encodeURIComponent(id)}/questions/options`,{question:form.dataset.question,query:""}) : post(`/api/jobs/${encodeURIComponent(id)}/questions/refresh`),result => result.message);
+    } else if (name === "resume-application") {
+      const job = list(state.jobs).find(item => String(item.id) === id);
+      if (dirty.profile || dirty.rules) { showNotice("Save and review your edits before resuming an application.",true); return; }
+      if (!job || !canResumeApplication(job) || button.closest(".verification-card")?.dataset.pause !== job.verification?.pause_id || !button.closest(".verification-card")?.querySelector(".verification-ack")?.checked) { showNotice("Complete the displayed step in its Jobot browser, then check the acknowledgment before resuming.",true); return; }
+      action(`resume-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/application/resume`,{session_id:job.verification.session_id,pause_id:job.verification.pause_id,acknowledge:true,expected_fingerprint:state.approval.candidate_fingerprint}),result => result.message);
+    } else if (name === "focus-application") {
+      const card = button.closest(".verification-card");
+      const job = list(state.jobs).find(item => String(item.id) === id);
+      if (!job || card?.dataset.pause !== job.verification?.pause_id) { showNotice("The application step changed. Review its latest status.",true); return; }
+      action(`focus-session-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/application/focus`,{session_id:job.verification.session_id,pause_id:card.dataset.pause}),result => result.message);
+    } else if (name === "cancel-application") {
+      const card = button.closest(".verification-card");
+      const job = list(state.jobs).find(item => String(item.id) === id);
+      if (!job || card?.dataset.pause !== job.verification?.pause_id) { showNotice("The application step changed. Review its latest status.",true); return; }
+      action(`cancel-session-${id}`,button,() => post(`/api/jobs/${encodeURIComponent(id)}/application/cancel`,{session_id:job.verification.session_id,pause_id:card.dataset.pause}),result => result.message);
     } else if (name === "check-platform") {
       const job = list(state.jobs).find(item => String(item.id) === id);
       if (!job || !canCheckPlatform(job)) { showNotice("This role cannot be checked in its current state. Refresh its recorded status.",true); return; }
@@ -1233,7 +1279,7 @@
     const selected = form.elements.company_scope.value === "selected";
     const where = form.elements.location_mode.value;
     const locations = where === "us" ? ["United States","USA","U.S.","US"] : where === "remote" ? ["Remote"] : where === "custom" ? exactLines(form.elements.locations.value) : [];
-    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever","greenhouse"] : [],min_score:Number(form.elements.min_score.value),daily_limit:dailyLimitValue(form),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
+    const body = {company_scope:selected ? "selected" : "any",companies:selected ? exactLines(form.elements.companies.value) : [],company_boards:state.rules?.company_boards || {},locations,allowed_ats:form.elements.allowed_ats.checked ? ["lever","greenhouse","ashby","smartrecruiters","workday"] : [],min_score:Number(form.elements.min_score.value),daily_limit:dailyLimitValue(form),interval_minutes:Number(form.elements.interval_minutes.value),require_known_eligibility:form.elements.require_known_eligibility.checked};
     body.max_required_experience_months = form.elements.max_required_experience_months.value === "" ? null : Number(form.elements.max_required_experience_months.value);
     body.prefer_new_grad = form.elements.prefer_new_grad.checked;
     body.enforce_graduation_window = form.elements.enforce_graduation_window.checked;

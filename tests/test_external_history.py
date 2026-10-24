@@ -100,7 +100,7 @@ def test_concurrent_external_history_records_are_idempotent(tmp_path):
 @pytest.mark.parametrize("url", ["", "not a URL", URL.replace("https:", "http:"), URL.replace("jobs.lever.co", "evil.test"), URL.replace("jobs.lever.co", "user@jobs.lever.co"), URL.replace("jobs.lever.co", "jobs.lever.co:bad"), URL.replace("12345678-abcd-1234-abcd-123456789abc", "not-a-posting")])
 def test_store_rejects_invalid_external_application_urls(tmp_path, url):
     store = Store(tmp_path / "db.sqlite3")
-    with pytest.raises(ValueError, match="HTTPS Lever"):
+    with pytest.raises(ValueError, match="HTTPS employer"):
         store.record_external_application(url)
     with store.connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM destination_attempts").fetchone()[0] == 0

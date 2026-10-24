@@ -25,9 +25,14 @@ from .job_facts import published_pay
 MAX_JOBS = 100
 MAX_SOURCE_BYTES = 2_000_000
 MAX_EMPLOYER_BYTES = 1_500_000
+MAX_ASHBY_BOARD_BYTES = 5_000_000
 SOURCE_TIMEOUT_SECONDS = 15.0
 DETAIL_TIMEOUT_SECONDS = 12.0
 DETAIL_BUDGET_SECONDS = 45.0
+
+
+def employer_response_limit(endpoint):
+    return MAX_ASHBY_BOARD_BYTES if urlsplit(endpoint).hostname == "api.ashbyhq.com" else MAX_EMPLOYER_BYTES
 
 
 def us_location(location: str) -> bool:
@@ -160,6 +165,9 @@ def _plain_content(value):
 def employer_metadata(job: dict, payload: dict) -> dict:
     """Check the exact posting before trusting an official description."""
     destination = parse_destination(job.get("apply_url"))
+    if destination and destination["ats"] in {"ashby", "smartrecruiters", "workday"}:
+        from .platform_postings import platform_metadata
+        return platform_metadata(job, payload)
     if not destination or not isinstance(payload, dict) or str(payload.get("id")) != destination["posting_id"]:
         raise ValueError("The employer response did not match the requested posting ID")
     if destination["ats"] == "lever":
@@ -217,24 +225,29 @@ async def enrich_employer_details(jobs: list[dict]) -> list[dict]:
     semaphore = asyncio.Semaphore(3)
     finished = set()
     async with ingest._client() as client:
+        reads = {}
+        async def read_endpoint(endpoint):
+            async with semaphore:
+                return await asyncio.wait_for(ingest._fetch_text(client, endpoint, employer_response_limit(endpoint)), DETAIL_TIMEOUT_SECONDS)
         async def resolve(index, job):
             endpoint = public_detail_url(job.get("apply_url"))
             if not endpoint:
                 job["fetch_error"] = "This published application link needs manual review; no supported public description adapter is available."
                 finished.add(index)
                 return
-            async with semaphore:
-                try:
-                    raw = await asyncio.wait_for(ingest._fetch_text(client, endpoint, MAX_EMPLOYER_BYTES), DETAIL_TIMEOUT_SECONDS)
-                    jobs[index] = employer_metadata(job, json.loads(raw))
-                except asyncio.TimeoutError:
-                    job["fetch_error"] = "The employer's public description request exceeded its time limit."
-                except httpx.HTTPStatusError as error:
-                    job["fetch_error"] = ingest._error_message(error)
-                    if error.response.status_code in {404, 410}:
-                        job["closed"] = True
-                except (httpx.HTTPError, ValueError, TypeError, RecursionError, AttributeError) as error:
-                    job["fetch_error"] = ingest._error_message(error)
+            try:
+                if endpoint not in reads:
+                    reads[endpoint] = asyncio.create_task(read_endpoint(endpoint))
+                raw = await reads[endpoint]
+                jobs[index] = employer_metadata(job, json.loads(raw))
+            except asyncio.TimeoutError:
+                job["fetch_error"] = "The employer's public description request exceeded its time limit."
+            except httpx.HTTPStatusError as error:
+                job["fetch_error"] = ingest._error_message(error)
+                if error.response.status_code in {404, 410}:
+                    job["closed"] = True
+            except (httpx.HTTPError, ValueError, TypeError, RecursionError, AttributeError) as error:
+                job["fetch_error"] = ingest._error_message(error)
             finished.add(index)
         tasks = [asyncio.create_task(resolve(index, job)) for index, job in enumerate(jobs)]
         try:
@@ -248,6 +261,10 @@ async def enrich_employer_details(jobs: list[dict]) -> list[dict]:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for task in reads.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*reads.values(), return_exceptions=True)
     return jobs
 
 

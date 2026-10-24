@@ -66,7 +66,7 @@ def test_pending_roles_are_not_misrepresented_as_submission_ready(client):
     assert "approve" in " ".join(queue["blockers"])
     by_id = {job["id"]: job for job in state["jobs"]}
     assert by_id["ready"]["submission_check"] == {"eligible": True, "matches_rules": True, "blockers": []}
-    assert "Lever" in " ".join(by_id["unsupported"]["submission_check"]["blockers"])
+    assert "canonical supported HTTPS" in " ".join(by_id["unsupported"]["submission_check"]["blockers"])
     assert "minimum" in " ".join(by_id["low-fit"]["submission_check"]["blockers"])
     assert "demo" not in by_id
     assert client.app.state.store.job("demo")["demo"] is True
@@ -169,16 +169,16 @@ def test_unchecked_lever_preference_saves_but_cannot_approve_or_run(client):
     assert state["rules"]["allowed_ats"] == []
     assert not state["approval"]["approved"]
     assert state["queue"]["ready"] == 0
-    assert any("Enable Lever" in problem for problem in state["setup_problems"])
+    assert any("Enable a supported application platform" in problem for problem in state["setup_problems"])
     response = client.post("/api/approve", headers=HEADERS, json={
         "acknowledge": True, "expected_fingerprint": state["approval"]["candidate_fingerprint"]})
     assert response.status_code == 400
-    assert "Enable Lever" in response.json()["detail"]
+    assert "Enable a supported application platform" in response.json()["detail"]
     assert client.post("/api/run", headers=HEADERS).status_code == 409
     assert client.post("/api/automation", headers=HEADERS, json={"enabled": True}).status_code == 409
 
 
-@pytest.mark.parametrize("ats", [["ashby"], ["lever", "workday"], ["lever", "lever"]])
+@pytest.mark.parametrize("ats", [["icims"], ["lever", "taleo"], ["lever", "lever"]])
 def test_rules_still_reject_unsupported_application_systems(client, ats):
     response = client.post("/api/rules", headers=HEADERS, json={**RULES, "allowed_ats": ats})
     assert response.status_code == 422
