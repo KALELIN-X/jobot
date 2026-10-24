@@ -1,6 +1,8 @@
 # Jobot
 
-A private, local job-search workspace: discover US software engineering new-grad roles with direct employer links, compare official job descriptions against your resume, and fill and submit supported applications under rules you explicitly approve.
+A local-first job-search workspace: discover US software engineering new-grad roles with direct employer links, compare official job descriptions against your resume, and fill and submit supported applications under rules you explicitly approve.
+
+The source code can be shared publicly. Your profile, resume, saved answers, browser captures, and application history stay in your own ignored local `data/` folder and are not included in a GitHub clone. Jobot runs on your computer; publishing its source does not host the dashboard or start applications.
 
 This is a newly built project. The application worker has bounded adapters for Lever, Greenhouse, Ashby, SmartRecruiters and Workday, with synthetic local-browser fixtures for supported controls, pause/resume and submission checks. A separately authorized, guided Greenhouse application was visibly confirmed by the employer during onboarding and recorded in local history; that manual session is separate from automatic adapter testing. Public description retrieval and local form tests do not guarantee unattended success or delivery on every live employer form.
 
@@ -18,20 +20,19 @@ cd jobot
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-If the repository is private, sign in to GitHub with an account that has access when Git asks. Do not put a password or access token in the clone URL. The existing local checkout is `D:\Projects\jobot`; open that folder and run only the setup command when updating its dependencies.
+For an existing checkout, open its project folder and run only the setup command when updating dependencies. Never put a password or access token in a clone URL.
 
 Setup creates the local Python environment, installs the pinned dependencies, and downloads the Playwright browser used for supported forms. Internet access is needed for setup, fetching listings, and real applications. No paid service, AI subscription, API key, or browser extension is required. There is no frontend build step.
 
 ## Daily launch
 
-For the existing installation, open PowerShell and run:
+Open PowerShell in your cloned `jobot` folder and run:
 
 ```powershell
-cd D:\Projects\jobot
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-For a fresh clone elsewhere, replace the first command with its actual folder. Jobot runs independently of Codex once launched.
+The launch script uses its own project folder, so the checkout can live wherever you choose. Jobot runs independently of Codex once launched.
 
 After the server starts, open [Jobot on this computer](http://127.0.0.1:8765/) in your browser. The launcher prints this address but does not open a tab for you. This loopback address works only on the computer running the app. If Jobot is already running, the launcher reports that and returns rather than starting a second server; keep the original server window open.
 
@@ -54,7 +55,7 @@ Open **Application profile** for the six-step setup: identity, US work authoriza
 
 The setup catalog comes from common questions encountered during development, including authorization, separate present/future sponsorship, legal/preferred names, multiple degrees, GPA, internship count and dates, relocation, pay, travel and deadlines. It contains question definitions and examples, **not this project's owner's personal answers**. See [question handling](docs/QUESTION_HANDLING.md) for reuse boundaries and extension guidance.
 
-This release remains a private local app. The application policy is now version 6, requiring one fresh review and approval after upgrading. Fresh installations enable the five bounded providers in their default rules. An existing explicit Lever/Greenhouse-only selection stays saved until you change it and review the resulting configuration. Public inspection alone never grants submission permission or adds hosted user accounts.
+This release remains a single-user local app. The application policy is now version 6, requiring one fresh review and approval after upgrading. Fresh installations enable the five bounded providers in their default rules. An existing explicit Lever/Greenhouse-only selection stays saved until you change it and review the resulting configuration. Public inspection alone never grants submission permission or adds hosted user accounts.
 
 1. **Fetch jobs:** imports up to **100 US software-engineering rows per refresh** from the public SimplifyJobs new-grad list, prioritizing supported direct employer links. Official employer GET endpoints supply descriptions and verify the exact posting. Other published application links remain available for manual review. Jobright is a bounded fallback if the primary source is unavailable or has no usable US rows. Before you add a resume, fit scores remain unknown. Uploading a resume reranks saved listings. Cards show location, required experience, stated pay, education, and graduation windows. Open **Checks & details** for blockers and score evidence, or **Open role** for the complete employer posting.
 2. **Profile & resume:** enter your legal full name and separate legal first/last names, plus a preferred first name if you use one. The app uses only the name fields you supply; it does not split a full name or substitute a preferred name for a legal name. Add verified contact details, links, skills, experience, and an actual resume PDF or UTF-8 text file. Graduation month accepts `YYYY-MM`; it does not invent a day when you know only a month. Use **Answer memory** below the profile to save reusable answers without editing JSON. Use Application profile for structured education, employment and common application preferences. Confirm approved work locations separately from your current address, including any relocation you actually authorize. Optional eligibility answers start unknown. The app does not infer citizenship, work authorization, sponsorship, or other personal facts from your resume. Save reusable answers only when they are accurate for the recognized meaning and reuse scope shown in the editor.
@@ -194,7 +195,6 @@ Each browser run uses an isolated context without importing your browser cookies
 Run tests in a separate PowerShell window from the project folder. Set an isolated import directory first: importing `jobradar.app` also constructs its default application, and tests must not open the normal private database.
 
 ```powershell
-cd D:\Projects\jobot
 $jobotTestId = [guid]::NewGuid().ToString("N")
 $env:JOBRADAR_DATA_DIR = Join-Path (Get-Location) ("data\test-import-" + $jobotTestId)
 try {
